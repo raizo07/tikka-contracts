@@ -674,118 +674,131 @@ impl Contract {
     }
 
     pub fn buy_tickets(env: Env, buyer: Address, quantity: u32) -> Result<u32, Error> {
-        let mut raffle = read_raffle(&env)?;
-        buyer.require_auth();
-        require_not_paused(&env)?;
+        // Issue #159: Acquire reentrancy guard first
+        acquire_guard(&env)?;
 
-        // --- 1. CHECKS ---
-        if raffle.status != RaffleStatus::Active {
-            return Err(Error::RaffleInactive);
-        }
-        if !raffle.prize_deposited {
-            return Err(Error::InvalidStateTransition);
-        }
-        if raffle.end_time != 0 && env.ledger().timestamp() > raffle.end_time {
-            return Err(Error::RaffleExpired);
-        }
+        let result = (|| {
+            let mut raffle = read_raffle(&env)?;
+            buyer.require_auth();
+            require_not_paused(&env)?;
 
-        // Check total availability for the whole batch
-        if raffle.tickets_sold + quantity > raffle.max_tickets {
-            return Err(Error::TicketsSoldOut);
-        }
+            // --- 1. CHECKS ---
+            if raffle.status != RaffleStatus::Active {
+                return Err(Error::RaffleInactive);
+            }
+            if !raffle.prize_deposited {
+                return Err(Error::InvalidStateTransition);
+            }
+            if raffle.end_time != 0 && env.ledger().timestamp() > raffle.end_time {
+                return Err(Error::RaffleExpired);
+            }
+            // Issue #161: Enforce minimum ticket price validation
+            if raffle.ticket_price < MIN_TICKET_PRICE {
+                return Err(Error::InvalidParameters);
+            }
 
-        let current_count = read_ticket_count(&env, &buyer);
-        // Respect allow_multiple: Block if they own tickets OR trying to buy > 1 in this batch
-        if !raffle.allow_multiple && (current_count > 0 || quantity > 1) {
-            return Err(Error::MultipleTicketsNotAllowed);
-        }
+            // Check total availability for the whole batch
+            if raffle.tickets_sold + quantity > raffle.max_tickets {
+                return Err(Error::TicketsSoldOut);
+            }
 
-        // --- 2. EFFECTS ---
-        let mut ticket_ids = Vec::new(&env);
-        let timestamp = env.ledger().timestamp();
-        let total_price = raffle
-            .ticket_price
-            .checked_mul(quantity as i128)
-            .ok_or(Error::InvalidParameters)?;
+            let current_count = read_ticket_count(&env, &buyer);
+            // Respect allow_multiple: Block if they own tickets OR trying to buy > 1 in this batch
+            if !raffle.allow_multiple && (current_count > 0 || quantity > 1) {
+                return Err(Error::MultipleTicketsNotAllowed);
+            }
 
-        for _ in 0..quantity {
-            let ticket_id = next_ticket_id(&env);
-            raffle.tickets_sold += 1;
+            // --- 2. EFFECTS ---
+            let mut ticket_ids = Vec::new(&env);
+            let timestamp = env.ledger().timestamp();
+            let total_price = raffle
+                .ticket_price
+                .checked_mul(quantity as i128)
+                .ok_or(Error::InvalidParameters)?;
 
-            let ticket = Ticket {
-                id: ticket_id,
-                owner: buyer.clone(),
-                purchase_time: timestamp,
-                ticket_number: raffle.tickets_sold,
-            };
-            write_ticket(&env, &ticket);
-            ticket_ids.push_back(ticket_id);
-        }
+            for _ in 0..quantity {
+                let ticket_id = next_ticket_id(&env);
+                raffle.tickets_sold += 1;
 
-        // Auto-transition to Drawing if sold out
-        if raffle.tickets_sold >= raffle.max_tickets {
-            let old_status = raffle.status.clone();
-            raffle.status = RaffleStatus::Drawing;
-            RaffleStatusChanged {
-                    old_status: RaffleStatus::Active,
-                    new_status: RaffleStatus::Drawing,
+                let ticket = Ticket {
+                    id: ticket_id,
+                    owner: buyer.clone(),
+                    purchase_time: timestamp,
+                    ticket_number: raffle.tickets_sold,
+                };
+                write_ticket(&env, &ticket);
+                ticket_ids.push_back(ticket_id);
+            }
+
+            // Auto-transition to Drawing if sold out
+            if raffle.tickets_sold >= raffle.max_tickets {
+                let old_status = raffle.status.clone();
+                raffle.status = RaffleStatus::Drawing;
+                RaffleStatusChanged {
+                        old_status: RaffleStatus::Active,
+                        new_status: RaffleStatus::Drawing,
+                        timestamp,
+                    }.publish(&env);
+            }
+
+            write_ticket_count(&env, &buyer, current_count + quantity);
+            write_raffle(&env, &raffle);
+
+            // Interaction: external token transfer — buyer pays for the ticket.
+            // Use try_transfer so a broken token surfaces as a typed error.
+            // Update global volume in factory
+            if let Some(factory_address) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&DataKey::Factory)
+            {
+                env.invoke_contract::<()>(
+                    &factory_address,
+                    &Symbol::new(&env, "record_volume"),
+                    (raffle.payment_token.clone(), total_price).into_val(&env),
+                );
+            }
+
+            // Single atomic transfer for the entire batch
+            let token_client = token::Client::new(&env, &raffle.payment_token);
+            let contract_address = env.current_contract_address();
+
+            // If it's native XLM, we could potentially use specialized logic,
+            // but token::Client works perfectly and is the standard way.
+            // We log detection for auditing as requested in the task.
+            if is_native_xlm(&env, &raffle.payment_token) {
+                // In some versions of Soroban, native might require specific authorization,
+                // but here we rely on the standard SAC which works with require_auth.
+            }
+
+            token_client
+                .try_transfer(&buyer, &contract_address, &total_price)
+                .map_err(|_| Error::TokenTransferFailed)?;
+
+            // Single event containing the range of IDs
+            TicketPurchased {
+                    buyer: buyer.clone(),
+                    ticket_ids,
+                    quantity,
+                    ticket_price: raffle.ticket_price,
+                    total_paid: total_price,
                     timestamp,
                 }.publish(&env);
-        }
 
-        write_ticket_count(&env, &buyer, current_count + quantity);
-        write_raffle(&env, &raffle);
-
-        // Interaction: external token transfer — buyer pays for the ticket.
-        // Use try_transfer so a broken token surfaces as a typed error.
-        // Update global volume in factory
-        if let Some(factory_address) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::Factory)
-        {
-            env.invoke_contract::<()>(
-                &factory_address,
-                &Symbol::new(&env, "record_volume"),
-                (raffle.payment_token.clone(), total_price).into_val(&env),
-            );
-        }
-
-        // Single atomic transfer for the entire batch
-        let token_client = token::Client::new(&env, &raffle.payment_token);
-        let contract_address = env.current_contract_address();
-
-        // If it's native XLM, we could potentially use specialized logic,
-        // but token::Client works perfectly and is the standard way.
-        // We log detection for auditing as requested in the task.
-        if is_native_xlm(&env, &raffle.payment_token) {
-            // In some versions of Soroban, native might require specific authorization,
-            // but here we rely on the standard SAC which works with require_auth.
-        }
-
-        token_client
-            .try_transfer(&buyer, &contract_address, &total_price)
-            .map_err(|_| Error::TokenTransferFailed)?;
-
-        // Single event containing the range of IDs
-        TicketPurchased {
-                buyer: buyer.clone(),
-                ticket_ids,
-                quantity,
-                ticket_price: raffle.ticket_price,
-                total_paid: total_price,
-                timestamp,
-            }.publish(&env);
-
-        Ok(raffle.tickets_sold)
+            Ok(raffle.tickets_sold)
+        })();
+        
+        // Issue #159: Release reentrancy guard before returning
+        release_guard(&env);
+        result
     }
 
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
         require_creator(&env)?;
         let mut raffle = read_raffle(&env)?;
 
-        // Only allowed if Active (ended) or Drawing (failed randomness/timeout)
-        if raffle.status != RaffleStatus::Active && raffle.status != RaffleStatus::Drawing {
+        // Issue #166: Only allow finalization from Active state to prevent multiple calls
+        if raffle.status != RaffleStatus::Active {
             return Err(Error::InvalidStatus);
         }
 
