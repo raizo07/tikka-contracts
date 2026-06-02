@@ -170,6 +170,23 @@ fn release_guard(env: &Env) {
     env.storage().instance().remove(&DataKey::ReentrancyGuard);
 }
 
+struct Guard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> Guard<'a> {
+    fn new(env: &'a Env) -> Result<Self, Error> {
+        acquire_guard(env)?;
+        Ok(Guard { env })
+    }
+}
+
+impl<'a> Drop for Guard<'a> {
+    fn drop(&mut self) {
+        release_guard(self.env);
+    }
+}
+
 fn require_not_paused(env: &Env) -> Result<(), Error> {
     if env
         .storage()
@@ -548,7 +565,7 @@ impl Contract {
 
     pub fn claim_prize(env: Env, winner: Address, tier_index: u32) -> Result<i128, Error> {
         winner.require_auth();
-        acquire_guard(&env)?;
+        let _guard = Guard::new(&env)?;
         let mut raffle = read_raffle(&env)?;
 
         if raffle.status != RaffleStatus::Finalized {
@@ -610,7 +627,6 @@ impl Contract {
             claimed_at: env.ledger().timestamp(),
         }.publish(&env);
 
-        release_guard(&env);
         Ok(net_amount)
     }
 
@@ -681,6 +697,7 @@ impl Contract {
             return Err(Error::InvalidStatus);
         }
 
+        let _guard = Guard::new(&env)?;
         let ticket: Ticket = env.storage().persistent().get(&DataKey::Ticket(ticket_id)).ok_or(Error::TicketNotFound)?;
         ticket.owner.require_auth();
 
@@ -704,7 +721,6 @@ impl Contract {
             timestamp: env.ledger().timestamp(),
         }.publish(&env);
 
-        release_guard(&env);
         Ok(raffle.ticket_price)
     }
 
