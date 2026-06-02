@@ -325,6 +325,7 @@ impl Contract {
     }
 
     pub fn buy_tickets(env: Env, buyer: Address, quantity: u32) -> Result<u32, Error> {
+        // Step 1: initial read + basic checks
         let mut raffle = read_raffle(&env)?;
         buyer.require_auth();
         require_not_paused(&env)?;
@@ -339,7 +340,9 @@ impl Contract {
             return Err(Error::RaffleExpired);
         }
 
-        if raffle.tickets_sold + quantity > raffle.max_tickets {
+        // Snapshot sold and buyer count for optimistic concurrency
+        let snapshot_sold = raffle.tickets_sold;
+        if snapshot_sold + quantity > raffle.max_tickets {
             return Err(Error::TicketsSoldOut);
         }
 
@@ -348,7 +351,9 @@ impl Contract {
             return Err(Error::MultipleTicketsNotAllowed);
         }
 
-        let mut ticket_ids = Vec::new(&env);
+        // Reserve ticket id range from NextTicketId (read-only for now)
+        let current_next: u32 = env.storage().instance().get(&DataKey::NextTicketId).unwrap_or(0u32);
+        let first_id = current_next + 1;
         let timestamp = env.ledger().timestamp();
         let total_price = raffle
             .ticket_price
@@ -360,19 +365,47 @@ impl Contract {
             .ok_or(Error::ArithmeticOverflow)? / 10000;
         let net_amount = total_price - protocol_fee;
 
-        for _ in 0..quantity {
-            let ticket_id = next_ticket_id(&env);
-            raffle.tickets_sold += 1;
+        // Prepare ticket ids locally
+        let mut ticket_ids = Vec::new(&env);
+        for i in 0..quantity {
+            let ticket_id = first_id + i;
+            ticket_ids.push_back(ticket_id);
+        }
 
+        // Step 2: re-read persisted state and verify no concurrent changes
+        let persisted_raffle = read_raffle(&env)?;
+        let persisted_sold = persisted_raffle.tickets_sold;
+        let persisted_count: u32 = env.storage().persistent().get(&DataKey::TicketCount(buyer.clone())).unwrap_or(0);
+
+        if persisted_sold != snapshot_sold || persisted_count != current_count {
+            return Err(Error::InvalidStateTransition);
+        }
+
+        // Final availability check against persisted values
+        if persisted_sold + quantity > persisted_raffle.max_tickets {
+            return Err(Error::TicketsSoldOut);
+        }
+
+        // Step 3: commit all changes atomically within this invocation
+        for i in 0..quantity {
+            let ticket_id = first_id + i;
+            let ticket_number = snapshot_sold + i + 1;
             let ticket = Ticket {
                 id: ticket_id,
                 owner: buyer.clone(),
                 purchase_time: timestamp,
-                ticket_number: raffle.tickets_sold,
+                ticket_number,
             };
             env.storage().persistent().set(&DataKey::Ticket(ticket_id), &ticket);
-            ticket_ids.push_back(ticket_id);
         }
+
+        // Advance NextTicketId
+        let new_next = current_next + quantity;
+        env.storage().instance().set(&DataKey::NextTicketId, &new_next);
+
+        // Update ticket count and raffle sold
+        env.storage().persistent().set(&DataKey::TicketCount(buyer.clone()), &(current_count + quantity));
+        raffle.tickets_sold = snapshot_sold + quantity;
 
         if raffle.tickets_sold >= raffle.max_tickets {
             let old_status = raffle.status.clone();
@@ -384,7 +417,6 @@ impl Contract {
             }.publish(&env);
         }
 
-        env.storage().persistent().set(&DataKey::TicketCount(buyer.clone()), &(current_count + quantity));
         write_raffle(&env, &raffle);
 
         if let Some(factory_address) = env.storage().instance().get::<_, Address>(&DataKey::Factory) {
