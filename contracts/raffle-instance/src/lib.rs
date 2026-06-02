@@ -23,6 +23,7 @@ use crate::events::{
     RandomnessRequested, TicketPurchased,
     WinnerDrawn, RandomnessFallbackTriggered,
     ContractPaused, ContractUnpaused,
+    EmergencyWithdrawn,
 };
 
 const ORACLE_TIMEOUT_LEDGERS: u32 = 200;
@@ -32,6 +33,8 @@ pub const MIN_TICKET_PRICE: i128 = 10_000;
 /// Default and bounds for the claim lockup delay (#259).
 pub const DEFAULT_CLAIM_LOCKUP_SECONDS: u64 = 3_600;
 pub const MAX_CLAIM_LOCKUP_SECONDS: u64 = 604_800; // 7 days
+/// Emergency withdraw delay (seconds). Set to 90 days.
+pub const EMERGENCY_WITHDRAW_DELAY_SECONDS: u64 = 90 * 24 * 3600; // 7776000
 
 #[contract]
 pub struct Contract;
@@ -124,6 +127,7 @@ pub enum Error {
     NotInitialized = 43,
     Reentrancy = 44,
     TokenTransferFailed = 45,
+    EmergencyTooEarly = 50,
 }
 
 fn read_raffle(env: &Env) -> Result<Raffle, Error> {
@@ -684,6 +688,60 @@ impl Contract {
 
         PrizeRefunded {
             creator: raffle.creator.clone(),
+            amount: raffle.prize_amount,
+            token: raffle.payment_token.clone(),
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn emergency_withdraw(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+        let mut raffle = read_raffle(&env)?;
+
+        if !raffle.prize_deposited {
+            return Err(Error::PrizeNotDeposited);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotAuthorized)?;
+        if caller != raffle.creator && caller != admin {
+            return Err(Error::NotAuthorized);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Allow emergency withdraw only after a long timeout.
+        match raffle.status {
+            RaffleStatus::Finalized => {
+                if let Some(finalized_at) = raffle.finalized_at {
+                    if now < finalized_at + EMERGENCY_WITHDRAW_DELAY_SECONDS {
+                        return Err(Error::EmergencyTooEarly);
+                    }
+                } else {
+                    return Err(Error::EmergencyTooEarly);
+                }
+            }
+            RaffleStatus::Drawing => {
+                // If raffle had an explicit end time, allow after end_time + delay
+                if raffle.end_time == 0 || now < raffle.end_time + EMERGENCY_WITHDRAW_DELAY_SECONDS {
+                    return Err(Error::EmergencyTooEarly);
+                }
+            }
+            _ => return Err(Error::InvalidStatus),
+        }
+
+        // Mark prize as withdrawn and transfer back to creator
+        raffle.prize_deposited = false;
+        raffle.status = RaffleStatus::Cancelled;
+        write_raffle(&env, &raffle);
+
+        let token_client = token::Client::new(&env, &raffle.payment_token);
+        token_client.transfer(&env.current_contract_address(), &raffle.creator, &raffle.prize_amount);
+
+        EmergencyWithdrawn {
+            withdrawn_by: caller,
+            to: raffle.creator.clone(),
             amount: raffle.prize_amount,
             token: raffle.payment_token.clone(),
             timestamp: env.ledger().timestamp(),

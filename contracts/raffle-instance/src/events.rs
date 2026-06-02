@@ -152,3 +152,14 @@ pub struct ContractUnpaused {
     pub unpaused_by: Address,
     pub timestamp: u64,
 }
+
+
+#[derive(Clone)]
+#[contractevent]
+pub struct EmergencyWithdrawn {
+    pub withdrawn_by: Address,
+    pub to: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
