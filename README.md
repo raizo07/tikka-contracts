@@ -114,18 +114,28 @@ flowchart TD
 -   **Soroban (Rust)**: Smart contract implementation
 -   **Stellar**: Network and asset contracts
 
-### **Core Contract**
+### **Core Contracts**
 
-#### **`contracts/hello-world/src/lib.rs`**
+#### **`contracts/raffle/src/lib.rs`**
 
 ```rust
-pub fn create_raffle(... ) -> u64;
-pub fn deposit_prize(... );
-pub fn buy_ticket(... ) -> u32;
-pub fn finalize_raffle(... ) -> Address;
-pub fn claim_prize(... );
-pub fn get_raffle(... ) -> Raffle;
-pub fn get_tickets(... ) -> Vec<Address>;
+pub fn init_factory(... ) -> Result<(), ContractError>;
+pub fn create_raffle(... ) -> Result<Address, ContractError>;
+pub fn get_raffles(... ) -> PageResultRaffles;
+```
+
+#### **`contracts/raffle-instance/src/lib.rs`**
+
+```rust
+pub fn init(... ) -> Result<(), Error>;
+pub fn deposit_prize(... ) -> Result<(), Error>;
+pub fn buy_tickets(... ) -> Result<u32, Error>;
+pub fn finalize_raffle(... ) -> Result<(), Error>;
+pub fn provide_randomness(... ) -> Result<(), Error>;
+pub fn claim_prize(... ) -> Result<i128, Error>;
+pub fn cancel_raffle(... ) -> Result<(), Error>;
+pub fn refund_ticket(... ) -> Result<i128, Error>;
+pub fn get_raffle(... ) -> Result<Raffle, Error>;
 ```
 
 ### **Data Structures**
@@ -238,13 +248,15 @@ stellar contract invoke ... -- \
 ### **Run Tests**
 
 ```bash
-cargo test -p hello-world
+cargo test -p raffle-factory
+cargo test -p raffle-instance
 ```
 
 ### **Build the Contract**
 
 ```bash
-cargo build -p hello-world
+cargo build -p raffle-factory
+cargo build -p raffle-instance
 ```
 
 ## 🛠️ Development
