@@ -20,7 +20,7 @@ use self::randomness::{
 use crate::events::{
     DrawTriggered, PrizeClaimed, PrizeDeposited, PrizeRefunded, RaffleCancelled, RaffleCreated,
     RaffleFinalized, RaffleStatusChanged, RandomnessReceived,
-    RandomnessRequested, TicketPurchased,
+    RandomnessRequested, TicketPurchased, TicketTransferred,
     WinnerDrawn, RandomnessFallbackTriggered,
     ContractPaused, ContractUnpaused,
 };
@@ -422,6 +422,67 @@ impl Contract {
         }.publish(&env);
 
         Ok(raffle.tickets_sold)
+    }
+
+    pub fn transfer_ticket(env: Env, ticket_id: u32, new_owner: Address) -> Result<(), Error> {
+        let mut raffle = read_raffle(&env)?;
+        let mut ticket: Ticket = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Ticket(ticket_id))
+            .ok_or(Error::TicketNotFound)?;
+
+        ticket.owner.require_auth();
+
+        if raffle.status != RaffleStatus::Active {
+            return Err(Error::InvalidStateTransition);
+        }
+
+        if raffle.end_time != 0 && env.ledger().timestamp() > raffle.end_time {
+            return Err(Error::RaffleExpired);
+        }
+
+        if ticket.owner == new_owner {
+            return Ok(());
+        }
+
+        let current_owner = ticket.owner.clone();
+        let old_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(current_owner.clone()))
+            .unwrap_or(0);
+
+        let new_owner_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(new_owner.clone()))
+            .unwrap_or(0);
+
+        if !raffle.allow_multiple && new_owner_count > 0 {
+            return Err(Error::MultipleTicketsNotAllowed);
+        }
+
+        let updated_old_count = old_count.checked_sub(1).ok_or(Error::InvalidStateTransition)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TicketCount(current_owner.clone()), &updated_old_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TicketCount(new_owner.clone()), &(new_owner_count + 1));
+
+        ticket.owner = new_owner.clone();
+        env.storage().persistent().set(&DataKey::Ticket(ticket_id), &ticket);
+
+        TicketTransferred {
+            ticket_id,
+            from: current_owner,
+            to: new_owner,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
     }
 
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
@@ -842,4 +903,125 @@ fn do_finalize_with_seed(
     }.publish(&env);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{Address, Env, String, Vec, BytesN};
+
+    fn setup_raffle(env: &Env, creator: Address) -> ContractClient<'_> {
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(env, &contract_id);
+        let mut prizes = Vec::new(env);
+        prizes.push_back(10000);
+
+        let config = RaffleConfig {
+            description: String::from_slice(env, "test raffle"),
+            end_time: 1_000_000,
+            max_tickets: 10,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: 10_000,
+            payment_token: Address::generate(env),
+            prize_amount: 100_000,
+            prizes,
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(env, &[1u8; 32]),
+        };
+
+        client
+            .init(&Address::generate(env), &Address::generate(env), &creator, &config)
+            .unwrap();
+        client
+    }
+
+    fn create_ticket(env: &Env, owner: Address, ticket_id: u32) {
+        let ticket = Ticket {
+            id: ticket_id,
+            owner: owner.clone(),
+            purchase_time: env.ledger().timestamp(),
+            ticket_number: ticket_id,
+        };
+        env.storage().persistent().set(&DataKey::Ticket(ticket_id), &ticket);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TicketCount(owner), &1u32);
+    }
+
+    #[test]
+    fn transfer_ticket_is_blocked_when_not_active() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = setup_raffle(&env, owner.clone());
+
+        let mut raffle = read_raffle(&env).unwrap();
+        raffle.status = RaffleStatus::Drawing;
+        write_raffle(&env, &raffle);
+
+        create_ticket(&env, owner.clone(), 1);
+
+        let result = client.transfer_ticket(&1u32, &recipient);
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), Error::InvalidStateTransition);
+    }
+
+    #[test]
+    fn transfer_ticket_is_blocked_after_end_time() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = setup_raffle(&env, owner.clone());
+
+        env.ledger().set(Ledger {
+            timestamp: 2_000_000,
+            sequence: env.ledger().sequence(),
+            network_id: env.ledger().network_id(),
+        });
+
+        create_ticket(&env, owner.clone(), 1);
+
+        let result = client.transfer_ticket(&1u32, &recipient);
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap(), Error::RaffleExpired);
+    }
+
+    #[test]
+    fn transfer_ticket_updates_owner_while_active() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let client = setup_raffle(&env, owner.clone());
+
+        create_ticket(&env, owner.clone(), 1);
+
+        client.transfer_ticket(&1u32, &recipient).unwrap();
+
+        let ticket: Ticket = env.storage()
+            .persistent()
+            .get(&DataKey::Ticket(1))
+            .unwrap();
+        assert_eq!(ticket.owner, recipient.clone());
+
+        let owner_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(owner))
+            .unwrap_or(0);
+        let recipient_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(recipient))
+            .unwrap_or(0);
+
+        assert_eq!(owner_count, 0);
+        assert_eq!(recipient_count, 1);
+    }
 }

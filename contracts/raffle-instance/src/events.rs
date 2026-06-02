@@ -49,6 +49,15 @@ pub struct TicketPurchased {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct TicketTransferred {
+    pub ticket_id: u32,
+    pub from: Address,
+    pub to: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct DrawTriggered {
     pub triggered_by: Address,
     pub total_tickets_sold: u32,
