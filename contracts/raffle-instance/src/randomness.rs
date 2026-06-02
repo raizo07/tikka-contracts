@@ -157,11 +157,31 @@ impl WinnerSelectionStrategy for OracleSeedWinnerSelection {
             return indices;
         }
 
+        // #257: Use rejection sampling to eliminate modulo bias.
+        // We discard samples that fall in the biased tail so every ticket in
+        // [0, total_tickets) is chosen with exactly equal probability.
+        //
+        // largest_multiple = floor(u64::MAX / total_tickets) * total_tickets
+        // Any sample >= largest_multiple is rejected and the seed advanced.
+        let n = total_tickets as u64;
+        let largest_multiple = (u64::MAX / n) * n;
+
         let mut current_seed = self.seed;
         for _ in 0..winner_count {
-            let idx = (current_seed % (total_tickets as u64)) as u32;
+            // Advance until the sample falls below the rejection threshold.
+            let idx = loop {
+                if current_seed < largest_multiple {
+                    break (current_seed % n) as u32;
+                }
+                // Mix the seed to get a new candidate; wrapping_mul with a
+                // large odd constant provides a fast, bias-free step.
+                current_seed = current_seed.wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+            };
             indices.push_back(idx);
-            current_seed = current_seed.wrapping_add(1);
+            // Advance the seed for the next winner so picks are independent.
+            current_seed = current_seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
         }
 
         indices
