@@ -93,6 +93,7 @@ pub enum DataKey {
     RandomnessRequestId,
     FinishTime,
     TotalTickets,
+    AccumulatedFees,
 }
 
 #[contracterror]
@@ -517,6 +518,8 @@ impl Contract {
             if let Some(treasury) = &raffle.treasury_address {
                 token_client.transfer(&env.current_contract_address(), treasury, &protocol_fee);
             }
+            let prev_fees: i128 = env.storage().instance().get(&DataKey::AccumulatedFees).unwrap_or(0);
+            env.storage().instance().set(&DataKey::AccumulatedFees, &(prev_fees + protocol_fee));
         }
 
         TicketPurchased {
@@ -746,6 +749,8 @@ impl Contract {
             if let Some(treasury) = &raffle.treasury_address {
                 token_client.transfer(&env.current_contract_address(), treasury, &fee);
             }
+            let prev_fees: i128 = env.storage().instance().get(&DataKey::AccumulatedFees).unwrap_or(0);
+            env.storage().instance().set(&DataKey::AccumulatedFees, &(prev_fees + fee));
         }
 
         PrizeClaimed {
