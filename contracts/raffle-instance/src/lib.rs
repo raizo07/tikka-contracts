@@ -226,6 +226,9 @@ impl Contract {
         if config.ticket_price < MIN_TICKET_PRICE {
             return Err(Error::InvalidParameters);
         }
+        if config.prize_amount <= 0 {
+            return Err(Error::InvalidParameters);
+        }
         if config.prize_amount < config.ticket_price {
             return Err(Error::InvalidParameters);
         }
@@ -301,6 +304,12 @@ impl Contract {
 
         if raffle.prize_deposited {
             return Err(Error::PrizeAlreadyDeposited);
+        }
+
+        // Reject zero-value prizes to avoid zero-value transfers and a raffle
+        // that is marked as funded while holding no actual prize.
+        if raffle.prize_amount <= 0 {
+            return Err(Error::InvalidParameters);
         }
 
         let old_status = raffle.status.clone();
@@ -842,4 +851,126 @@ fn do_finalize_with_seed(
     }.publish(&env);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn valid_config(env: &Env, payment_token: Address, prize_amount: i128) -> RaffleConfig {
+        let mut prizes = Vec::new(env);
+        prizes.push_back(10000u32);
+
+        RaffleConfig {
+            description: String::from_str(env, "test raffle"),
+            end_time: 0,
+            max_tickets: 100,
+            min_tickets: 0,
+            allow_multiple: false,
+            ticket_price: MIN_TICKET_PRICE,
+            payment_token,
+            prize_amount,
+            prizes,
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(env, &[1u8; 32]),
+        }
+    }
+
+    fn setup(env: &Env) -> (ContractClient<'_>, Address, Address) {
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(env, &contract_id);
+        let factory = Address::generate(env);
+        let admin = Address::generate(env);
+        (client, factory, admin)
+    }
+
+    #[test]
+    fn init_rejects_zero_prize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, factory, admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let config = valid_config(&env, token, 0);
+        let res = client.try_init(&factory, &admin, &creator, &config);
+        assert_eq!(res, Err(Ok(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn init_rejects_negative_prize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, factory, admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let config = valid_config(&env, token, -1);
+        let res = client.try_init(&factory, &admin, &creator, &config);
+        assert_eq!(res, Err(Ok(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn init_accepts_positive_prize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, factory, admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let config = valid_config(&env, token, MIN_TICKET_PRICE);
+        let res = client.try_init(&factory, &admin, &creator, &config);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn deposit_prize_rejects_zero_prize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _factory, _admin) = setup(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Bypass init validation by writing a raffle with a zero prize directly,
+        // so the guard inside deposit_prize is exercised in isolation.
+        env.as_contract(&client.address, || {
+            let mut raffle_vec = Vec::new(&env);
+            raffle_vec.push_back(0u32);
+            let raffle = Raffle {
+                creator: creator.clone(),
+                description: String::from_str(&env, "zero prize"),
+                end_time: 0,
+                max_tickets: 100,
+                min_tickets: 0,
+                allow_multiple: false,
+                ticket_price: MIN_TICKET_PRICE,
+                payment_token: token.clone(),
+                prize_amount: 0,
+                prizes: raffle_vec,
+                tickets_sold: 0,
+                status: RaffleStatus::Active,
+                prize_deposited: false,
+                winners: Vec::new(&env),
+                claimed_winners: Vec::new(&env),
+                randomness_source: RandomnessSource::Internal,
+                oracle_address: None,
+                protocol_fee_bp: 0,
+                treasury_address: None,
+                swap_router: None,
+                tikka_token: None,
+                finalized_at: None,
+                winner_ticket_id: None,
+            };
+            write_raffle(&env, &raffle);
+        });
+
+        let res = client.try_deposit_prize();
+        assert_eq!(res, Err(Ok(Error::InvalidParameters)));
+    }
 }
