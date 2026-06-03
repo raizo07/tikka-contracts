@@ -57,7 +57,7 @@ fn test_oracle_fallback_with_ledger_delays() {
 
     // 3. Deposit prize and buy ticket
     client.deposit_prize();
-    client.buy_tickets(&creator, &1);
+    client.buy_tickets(&creator, &10);
 
     // 4. Finalize raffle (requests randomness)
     client.finalize_raffle();
