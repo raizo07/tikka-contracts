@@ -54,7 +54,21 @@ pub fn build_internal_seed(env: &Env, raffle_id: &Address) -> BytesN<32> {
     // Using XDR serialisation guarantees an unambiguous, length-delimited
     // encoding so there are no collisions between differently-typed fields.
     let raw: Bytes = (timestamp, sequence, network_id, raffle_id.clone()).to_xdr(env);
-    env.crypto().sha256(&raw).into()
+    hash_bytes32(env, &raw)
+}
+
+/// Hashes the input with SHA-256 and validates the result.
+///
+/// On congested ledgers, the crypto operation may fail due to resource limits.
+/// In that case we expect the returned hash to be invalid rather than silently
+/// falling back to a zeroed seed, which would make winner selection
+/// deterministic and insecure.
+fn hash_bytes32(env: &Env, input: &Bytes) -> BytesN<32> {
+    let hash: BytesN<32> = env.crypto().sha256(input).into();
+    if hash.to_array() == [0u8; 32] {
+        panic!("crypto.sha256() failed: invalid hash output");
+    }
+    hash
 }
 
 /// Common winner-selection interface used by both PRNG and oracle paths.
@@ -110,7 +124,7 @@ impl PrngWinnerSelection {
         // XDR-pack the base seed + tickets_sold and re-hash to include the
         // extra entropy source without truncating the network_id contribution.
         let combined: Bytes = (base, self.tickets_sold).to_xdr(env);
-        env.crypto().sha256(&combined).into()
+        hash_bytes32(env, &combined).into()
     }
 }
 
@@ -248,6 +262,19 @@ mod tests {
         // BytesN<32> is always 32 bytes by construction; this is a compile-time
         // guarantee, but we also verify the array conversion is loss-free.
         assert_eq!(seed.to_array().len(), 32);
+    }
+
+    /// build_internal_seed must not produce the all-zero hash.
+    #[test]
+    fn build_internal_seed_is_not_zero() {
+        let env = Env::default();
+        let raffle_id = Address::generate(&env);
+        let contract = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+
+        let seed = env.as_contract(&contract, || build_internal_seed(&env, &raffle_id));
+        assert_ne!(seed.to_array(), [0u8; 32], "sha256 output must not be all zero");
     }
 
     /// PRNG selections fall within [0, total_tickets).

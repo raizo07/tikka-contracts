@@ -79,6 +79,7 @@ pub enum ContractError {
     TimelockNotElapsed = 15,
     InvalidRaffleId = 16,
     RaffleNotEligible = 17,
+    TreasuryNotSet = 18,
 }
 
 #[contract]
@@ -104,6 +105,24 @@ fn require_factory_not_paused(env: &Env) -> Result<(), ContractError> {
         return Err(ContractError::ContractPaused);
     }
     Ok(())
+}
+
+fn require_registered_raffle(env: &Env, raffle_address: &Address) -> Result<(), ContractError> {
+    raffle_address.require_auth();
+
+    let instances: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::RaffleInstances)
+        .unwrap_or_else(|| Vec::new(env));
+
+    for instance in instances.iter() {
+        if instance == *raffle_address {
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::NotAuthorized)
 }
 
 fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
@@ -314,6 +333,12 @@ impl RaffleFactory {
                 .unwrap_or(0);
 
             if now < last_creation + min_delay {
+                let unlock_timestamp = last_creation + min_delay;
+                events::CreationRateLimited {
+                    creator: creator.clone(),
+                    unlock_timestamp,
+                    timestamp: now,
+                }.publish(&env);
                 return Err(ContractError::RateLimitExceeded);
             }
 
@@ -333,7 +358,11 @@ impl RaffleFactory {
             .persistent()
             .get(&DataKey::ProtocolFeeBP)
             .unwrap_or(0);
-        let treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Treasury)
+            .ok_or(ContractError::TreasuryNotSet)?;
 
         let mut instances: Vec<Address> = env
             .storage()
@@ -435,7 +464,14 @@ impl RaffleFactory {
             .unwrap_or(0)
     }
 
-    pub fn record_volume(env: Env, asset: Address, amount: i128) -> Result<(), ContractError> {
+    pub fn record_volume(
+        env: Env,
+        raffle_address: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        require_registered_raffle(&env, &raffle_address)?;
+
         let mut total_volume: i128 = env
             .storage()
             .persistent()
