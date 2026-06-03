@@ -1,6 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, xdr::ToXdr, Address, Bytes, BytesN,
+    Env, IntoVal, String, Symbol, Vec,
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractimpl, token,
     xdr::ToXdr,
@@ -33,8 +35,7 @@ pub const MAX_CLAIM_LOCKUP_SECONDS: u64 = 604_800; // 7 days
 
 #[contract]
 pub struct Contract;
-
-#[soroban_sdk::contracttype]
+#[contracttype]
 #[derive(Clone)]
 pub struct Raffle {
     pub creator: Address,
@@ -65,7 +66,7 @@ pub struct Raffle {
     pub claim_lockup_seconds: u64,
 }
 
-#[soroban_sdk::contracttype]
+#[contracttype]
 #[derive(Clone)]
 pub struct FairnessMetadata {
     pub seed: u64,
@@ -1282,4 +1283,87 @@ fn do_finalize_with_seed(
 }
 
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{vec, Address, BytesN, Env, String};
+    use raffle_shared::RaffleConfig;
+
+    // Deploy a Stellar Asset Contract we control, return (token_client, admin_client).
+    fn create_token<'a>(env: &Env, admin: &Address) -> (Address, token::StellarAssetClient<'a>) {
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let addr = sac.address();
+        (addr.clone(), token::StellarAssetClient::new(env, &addr))
+    }
+    use soroban_sdk::contractimpl as _contractimpl; // ensure macro in scope (already imported)
+
+    #[contract]
+    pub struct MockFactory;
+
+    #[contractimpl]
+    impl MockFactory {
+    pub fn record_volume(_env: Env, _token: Address, _amount: i128) {}
+    pub fn track_participant(_env: Env, _participant: Address) {}
+    }
+
+    #[test]
+    fn non_winner_cannot_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        // Players
+        let factory = env.register(MockFactory, ());
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Payment token, funded
+        let token_admin = Address::generate(&env);
+        let (token_addr, token_mint) = create_token(&env, &token_admin);
+        token_mint.mint(&creator, &1_000_000);
+        token_mint.mint(&buyer, &1_000_000);
+
+        // One prize tier worth 100% (10000 bp)
+        let config = RaffleConfig {
+            description: String::from_str(&env, "test raffle"),
+            end_time: 0,                 // 0 => can finalize once tickets_full
+            max_tickets: 1,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: MIN_TICKET_PRICE,
+            payment_token: token_addr.clone(),
+            prize_amount: MIN_TICKET_PRICE * 10,
+            prizes: vec![&env, 10000u32],
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(&env, &[1u8; 32]),
+            claim_lockup_seconds: 0,     // => DEFAULT_CLAIM_LOCKUP_SECONDS (3600)
+        };
+
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer, &1);
+        client.finalize_raffle();
+
+        // Sanity: a winner is now recorded, and it is NOT the attacker.
+        let raffle = client.get_raffle();
+        assert_eq!(raffle.winners.len(), 1);
+        assert!(raffle.winners.get(0).unwrap() != attacker);
+
+        // Advance past the claim lockup so we reach the winner check, not ClaimTooEarly.
+        env.ledger().set_timestamp(1_000 + DEFAULT_CLAIM_LOCKUP_SECONDS + 1);
+
+        // Attacker authenticates fine (mock_all_auths) but is not the winner.
+        let result = client.try_claim_prize(&attacker, &0u32);
+        assert_eq!(result, Err(Ok(Error::NotWinner)));
+    }
+}
