@@ -18,6 +18,7 @@ Thanks for your interest in contributing to Tikka! This project targets Stellar/
 
 ```bash
 cargo test -p raffle-factory
+cargo test -p raffle-instance
 ```
 
 ## Pull Requests

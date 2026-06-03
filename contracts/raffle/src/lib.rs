@@ -85,7 +85,7 @@ pub enum ContractError {
     TimelockNotElapsed = 15,
     InvalidRaffleId = 16,
     RaffleNotEligible = 17,
-    TreasuryNotSet = 18,
+    ArithmeticOverflow = 18,
 }
 
 #[contract]
@@ -259,12 +259,21 @@ impl RaffleFactory {
 
         match pending.op.clone() {
             AdminOp::SetConfig(protocol_fee_bp, treasury) => {
+                let old_treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
+
                 env.storage()
                     .persistent()
                     .set(&DataKey::ProtocolFeeBP, &protocol_fee_bp);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Treasury, &treasury);
+
+                events::TreasuryChanged {
+                    old_treasury,
+                    new_treasury: treasury.clone(),
+                    changed_by: admin.clone(),
+                    timestamp: env.ledger().timestamp(),
+                }.publish(&env);
             }
         }
 
@@ -481,20 +490,15 @@ impl RaffleFactory {
             .unwrap_or(0)
     }
 
-    pub fn record_volume(
-        env: Env,
-        raffle_address: Address,
-        asset: Address,
-        amount: i128,
-    ) -> Result<(), ContractError> {
-        require_registered_raffle(&env, &raffle_address)?;
-
-        let mut total_volume: i128 = env
+    pub fn record_volume(env: Env, asset: Address, amount: i128) -> Result<(), ContractError> {
+        let total_volume: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::TotalVolumePerAsset(asset.clone()))
             .unwrap_or(0);
-        total_volume += amount;
+        let total_volume = total_volume
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         env.storage()
             .persistent()
             .set(&DataKey::TotalVolumePerAsset(asset), &total_volume);
@@ -721,6 +725,36 @@ impl RaffleFactory {
         Ok(())
     }
 
+    /// Sweep tokens accidentally sent to the factory contract.
+    pub fn rescue_tokens(
+        env: Env,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        let admin = require_admin(&env)?;
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidParameters);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client
+            .try_transfer(&env.current_contract_address(), &recipient, &amount)
+            .map_err(|_| ContractError::InvalidParameters)?;
+
+        events::FactoryTokensRescued {
+            rescued_by: admin,
+            token,
+            recipient,
+            amount,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn clean_old_raffle(env: Env, raffle_id: u32) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
 
@@ -786,5 +820,18 @@ mod tests {
         env.mock_all_auths();
         let (client, admin, _treasury) = setup_factory(&env);
         assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_record_volume_overflow() {
+        let env = Env::default();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let asset = Address::generate(&env);
+
+        assert_eq!(client.get_total_volume(&asset), 0);
+        assert_eq!(client.record_volume(&asset, &i128::MAX), Ok(()));
+        assert_eq!(client.get_total_volume(&asset), i128::MAX);
+        assert_eq!(client.record_volume(&asset, &1), Err(ContractError::ArithmeticOverflow));
+        assert_eq!(client.get_total_volume(&asset), i128::MAX);
     }
 }

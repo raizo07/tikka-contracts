@@ -114,15 +114,28 @@ flowchart TD
 -   **Soroban (Rust)**: Smart contract implementation
 -   **Stellar**: Network and asset contracts
 
-### **Core Contract**
+### **Core Contracts**
 
 #### **`contracts/raffle/src/lib.rs`**
 
 ```rust
 pub fn init_factory(... ) -> Result<(), ContractError>;
-pub fn create_raffle(... ) -> u64;
+pub fn create_raffle(... ) -> Result<Address, ContractError>;
 pub fn get_raffles(... ) -> PageResultRaffles;
-pub fn get_raffle_fairness_data(... ) -> FairnessData;
+```
+
+#### **`contracts/raffle-instance/src/lib.rs`**
+
+```rust
+pub fn init(... ) -> Result<(), Error>;
+pub fn deposit_prize(... ) -> Result<(), Error>;
+pub fn buy_tickets(... ) -> Result<u32, Error>;
+pub fn finalize_raffle(... ) -> Result<(), Error>;
+pub fn provide_randomness(... ) -> Result<(), Error>;
+pub fn claim_prize(... ) -> Result<i128, Error>;
+pub fn cancel_raffle(... ) -> Result<(), Error>;
+pub fn refund_ticket(... ) -> Result<i128, Error>;
+pub fn get_raffle(... ) -> Result<Raffle, Error>;
 ```
 
 ### **Data Structures**
@@ -246,6 +259,7 @@ stellar contract invoke ... -- \
 
 ```bash
 cargo test -p raffle-factory
+cargo test -p raffle-instance
 ```
 
 ### **Build the Contract**
@@ -253,6 +267,7 @@ cargo test -p raffle-factory
 ```bash
 cargo build -p raffle-instance
 cargo build -p raffle-factory
+cargo build -p raffle-instance
 ```
 
 ## 🛠️ Development

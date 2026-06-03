@@ -128,6 +128,15 @@ pub struct PrizeClaimed {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct FeesWithdrawn {
+    pub recipient: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct RandomnessFallbackTriggered {
     pub triggered_by: Address,
     pub seed_used: u64,
@@ -155,5 +164,26 @@ pub struct ContractPaused {
 #[contractevent]
 pub struct ContractUnpaused {
     pub unpaused_by: Address,
+    pub timestamp: u64,
+}
+
+
+#[derive(Clone)]
+#[contractevent]
+pub struct EmergencyWithdrawn {
+    pub withdrawn_by: Address,
+    pub to: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
+pub struct AdminChanged {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    #[topic]
+    pub changed_by: Address,
     pub timestamp: u64,
 }

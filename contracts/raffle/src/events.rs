@@ -30,6 +30,16 @@ pub struct AdminOpExecuted {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct TreasuryChanged {
+    pub old_treasury: Address,
+    pub new_treasury: Address,
+    #[topic]
+    pub changed_by: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct AdminOpCancelled {
     pub op_id: u32,
     pub cancelled_by: Address,
