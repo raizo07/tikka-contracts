@@ -356,12 +356,6 @@ impl RaffleFactory {
                 .set(&DataKey::LastCreationTime(creator.clone()), &now);
         }
 
-        let wasm_hash: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InstanceWasmHash)
-            .unwrap();
-
         let protocol_fee_bp: u32 = env
             .storage()
             .persistent()
@@ -386,15 +380,20 @@ impl RaffleFactory {
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         let factory_address = env.current_contract_address();
 
-        let salt = env
-            .crypto()
-            .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
-
         #[cfg(not(test))]
-        let raffle_address = env
-            .deployer()
-            .with_address(factory_address.clone(), salt)
-            .deploy_v2(wasm_hash, ());
+        let raffle_address = {
+            let wasm_hash: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InstanceWasmHash)
+                .unwrap();
+            let salt = env
+                .crypto()
+                .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
+            env.deployer()
+                .with_address(factory_address.clone(), salt)
+                .deploy_v2(wasm_hash, ())
+        };
 
         #[cfg(test)]
         let raffle_address = {
@@ -765,8 +764,6 @@ impl RaffleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-
     fn setup_factory(env: &Env) -> (RaffleFactoryClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
