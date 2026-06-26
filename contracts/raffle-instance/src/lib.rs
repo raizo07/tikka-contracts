@@ -95,6 +95,24 @@ pub enum DataKey {
     RandomnessRequestId,
     FinishTime,
     AccumulatedFees,
+    /// Stores the commit entry for a ticket in the commit-reveal scheme.
+    /// Keyed by ticket ID (not owner address) so the entry survives ticket
+    /// transfers: a ticket holder who committed and then transferred the
+    /// ticket still has their entropy contribution recorded here.
+    CommitEntry(u32),
+}
+
+/// A single participant commit recorded during the commit phase of a
+/// commit-reveal draw.  Keyed by ticket ID so the record is not lost when
+/// the ticket changes hands after the commit was submitted.
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitRevealEntry {
+    /// The address that submitted the commit (the ticket owner *at commit
+    /// time*).  Preserved for audit/fairness purposes.
+    pub committer: Address,
+    /// The hash the participant committed to (SHA-256 of their secret).
+    pub hash: BytesN<32>,
 }
 
 #[contracterror]
@@ -619,6 +637,48 @@ impl Contract {
         Ok(raffle.tickets_sold)
     }
 
+    /// Submit a commit during the commit phase of a commit-reveal draw.
+    ///
+    /// The entry is stored under `CommitEntry(ticket_id)` — keyed by the
+    /// ticket ID rather than the caller's address — so the entropy
+    /// contribution is preserved even if the ticket is subsequently
+    /// transferred to a different address before finalization.  This fixes
+    /// the silent entropy-drop identified in issue #311.
+    pub fn submit_commit(env: Env, ticket_id: u32, hash: BytesN<32>) -> Result<(), Error> {
+        let raffle = read_raffle(&env)?;
+
+        if raffle.randomness_source != RandomnessSource::CommitReveal {
+            return Err(Error::InvalidParameters);
+        }
+
+        // Commits may only be submitted while the raffle is still active.
+        if raffle.status != RaffleStatus::Active && raffle.status != RaffleStatus::Drawing {
+            return Err(Error::InvalidStatus);
+        }
+
+        // The ticket must exist.
+        let ticket: Ticket = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Ticket(ticket_id))
+            .ok_or(Error::TicketNotFound)?;
+
+        // Only the current ticket owner may submit (or update) a commit.
+        ticket.owner.require_auth();
+
+        // Store keyed by ticket ID so a later transfer does not orphan the
+        // entropy contribution.
+        let entry = CommitRevealEntry {
+            committer: ticket.owner,
+            hash,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommitEntry(ticket_id), &entry);
+
+        Ok(())
+    }
+
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
@@ -711,6 +771,40 @@ impl Contract {
             timestamp: now,
         }
         .publish(&env);
+
+        if raffle.randomness_source == RandomnessSource::CommitReveal {
+            // Collect entropy from all commit entries stored by ticket ID.
+            //
+            // We iterate over ticket IDs 1..=tickets_sold and read the
+            // CommitEntry for each one.  Keying by ticket ID (rather than by
+            // current owner address) is what makes the fix for #311: a
+            // participant who committed and then transferred their ticket
+            // still has their CommitEntry present under the original ticket
+            // ID, so their entropy is never silently discarded.
+            let mut combined = Bytes::new(&env);
+            let mut commits_found: u32 = 0;
+            for ticket_id in 1..=raffle.tickets_sold {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, CommitRevealEntry>(&DataKey::CommitEntry(ticket_id))
+                {
+                    combined.extend_from_array(&entry.hash.to_array());
+                    commits_found += 1;
+                }
+            }
+
+            // If no commits were submitted at all fall through to the
+            // internal PRNG so the raffle can still be finalised.
+            if commits_found > 0 {
+                let hash: BytesN<32> = env.crypto().sha256(&combined).into();
+                let arr = hash.to_array();
+                let mut seed_bytes = [0u8; 8];
+                seed_bytes.copy_from_slice(&arr[..8]);
+                let seed = u64::from_be_bytes(seed_bytes);
+                return self::do_finalize_with_seed(&env, raffle, seed, RandomnessType::Prng);
+            }
+        }
 
         let seed = build_internal_seed_u64(&env);
         self::do_finalize_with_seed(&env, raffle, seed, RandomnessType::Prng)
