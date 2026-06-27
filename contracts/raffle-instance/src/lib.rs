@@ -95,6 +95,7 @@ pub enum DataKey {
     RandomnessRequestId,
     FinishTime,
     AccumulatedFees,
+    DrawingLock,
 }
 
 #[contracterror]
@@ -142,6 +143,12 @@ pub enum Error {
     InvalidTicketRange = 55,
     InsufficientAccumulatedFees = 56,
     PrizeConfigurationLocked = 57,
+    // SECURITY: Prevents concurrent drawing processes from running
+    DrawingAlreadyInProgress = 58,
+    // SECURITY: Prevents oracle callback from running twice
+    DrawingAlreadyComplete = 59,
+    // SECURITY: Prevents drawing from invalid pre-conditions
+    InvalidStatusForDrawingTransition = 60,
 }
 
 fn read_raffle(env: &Env) -> Result<Raffle, Error> {
@@ -260,6 +267,43 @@ fn request_randomness(env: &Env) -> Result<u64, Error> {
         .set(&DataKey::RandomnessRequestId, &request_id);
 
     Ok(request_id)
+}
+
+/// Atomically transitions the raffle to Drawing status and sets DrawingLock
+///
+/// # SECURITY: This function is the single source of truth for entering Drawing status!
+fn transition_to_drawing(env: &Env, raffle: &mut Raffle, timestamp: u64) -> Result<(), Error> {
+    // SECURITY: Fast path guard: check DrawingLock first!
+    let drawing_lock: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::DrawingLock)
+        .unwrap_or(false);
+    if drawing_lock {
+        return Err(Error::DrawingAlreadyInProgress);
+    }
+    // Check current status before allowing transition
+    if raffle.status != RaffleStatus::Active && raffle.status != RaffleStatus::Drawing {
+        return Err(Error::InvalidStatusForDrawingTransition);
+    }
+
+    if raffle.status == RaffleStatus::Active {
+        let old_status = raffle.status.clone();
+        raffle.status = RaffleStatus::Drawing;
+        write_raffle(env, raffle);
+        RaffleStatusChanged {
+            old_status,
+            new_status: RaffleStatus::Drawing,
+            timestamp,
+        }
+        .publish(env);
+    }
+
+    // Atomically set the DrawingLock
+    env.storage()
+        .instance()
+        .set(&DataKey::DrawingLock, &true);
+    Ok(())
 }
 
 fn require_not_paused(env: &Env) -> Result<(), Error> {
@@ -516,6 +560,15 @@ impl Contract {
     }
 
     pub fn buy_tickets(env: Env, buyer: Address, quantity: u32) -> Result<u32, Error> {
+        // SECURITY: Fast path guard for DrawingLock!
+        let drawing_lock: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::DrawingLock)
+            .unwrap_or(false);
+        if drawing_lock {
+            return Err(Error::DrawingAlreadyInProgress);
+        }
         if quantity == 0 {
             return Err(Error::InvalidQuantity);
         }
@@ -576,16 +629,8 @@ impl Contract {
         }
 
         if raffle.tickets_sold >= raffle.max_tickets {
-            let old_status = raffle.status.clone();
-            raffle.status = RaffleStatus::Drawing;
-            RaffleStatusChanged {
-                old_status,
-                new_status: RaffleStatus::Drawing,
-                timestamp,
-            }
-            .publish(&env);
-
-            // SECURITY: Atomically request randomness when transitioning to Drawing
+            transition_to_drawing(&env, &mut raffle, timestamp)?;
+            // SECURITY: Atomically request randomness after transitioning to Drawing
             if raffle.randomness_source == RandomnessSource::External {
                 let request_id = request_randomness(&env)?;
                 DrawTriggered {
@@ -678,6 +723,15 @@ impl Contract {
     }
 
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
+        // SECURITY: Fast path guard for DrawingLock!
+        let drawing_lock: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::DrawingLock)
+            .unwrap_or(false);
+        if drawing_lock {
+            return Err(Error::DrawingAlreadyInProgress);
+        }
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
 
@@ -711,18 +765,7 @@ impl Contract {
 
         let caller = raffle.creator.clone();
 
-        // Transition to Drawing if we're still in Active
-        if raffle.status == RaffleStatus::Active {
-            let old_status = raffle.status.clone();
-            raffle.status = RaffleStatus::Drawing;
-            write_raffle(&env, &raffle);
-            RaffleStatusChanged {
-                old_status,
-                new_status: RaffleStatus::Drawing,
-                timestamp: now,
-            }
-            .publish(&env);
-        }
+        transition_to_drawing(&env, &mut raffle, now)?;
 
         if raffle.randomness_source == RandomnessSource::External {
             let request_id = request_randomness(&env)?;
