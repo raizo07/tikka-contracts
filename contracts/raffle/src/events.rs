@@ -1,5 +1,16 @@
 use raffle_shared::AdminOp;
 use soroban_sdk::{contractevent, u128, Address, BytesN};
+use soroban_sdk::{contractevent, Address, BytesN};
+
+#[allow(dead_code)]
+#[derive(Clone)]
+#[contractevent]
+pub struct RaffleInstanceDeployed {
+    pub instance: Address,
+    pub wasm_hash: BytesN<32>,
+    pub creator: Address,
+    pub timestamp: u64,
+}
 
 #[derive(Clone)]
 #[contractevent]
@@ -26,6 +37,17 @@ pub struct AdminOpExecuted {
     pub op: AdminOp,
     pub executed_by: Address,
     pub executed_at: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+#[contractevent]
+pub struct TreasuryChanged {
+    pub old_treasury: Address,
+    pub new_treasury: Address,
+    #[topic]
+    pub changed_by: Address,
+    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -66,6 +88,16 @@ pub struct AdminTransferAccepted {
     pub timestamp: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Clone)]
+#[contractevent]
+pub struct AdminTransferFailed {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+    pub reason_code: u32,
+    pub timestamp: u64,
+}
+
 #[derive(Clone)]
 #[contractevent]
 pub struct CheckpointCreated {
@@ -75,6 +107,16 @@ pub struct CheckpointCreated {
     pub aggregate_hash: BytesN<32>,
 }
 
+#[allow(dead_code)]
+#[derive(Clone)]
+#[contractevent]
+pub struct SupportedSacUpdated {
+    pub token: Address,
+    pub supported: bool,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
 #[derive(Clone)]
 #[contractevent]
 pub struct RaffleCleanedUp {
@@ -82,4 +124,30 @@ pub struct RaffleCleanedUp {
     pub cleaned_by: Address,
     pub finish_time: u64,
     pub cleaned_at: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
+pub struct CreationRateLimited {
+    pub creator: Address,
+    pub unlock_timestamp: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
+pub struct FactoryTokensRescued {
+    pub rescued_by: Address,
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
+pub struct FactoryUpgraded {
+    pub admin: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub timestamp: u64,
 }

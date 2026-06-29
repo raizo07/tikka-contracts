@@ -5,12 +5,18 @@ use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[contracttype]
 pub enum RaffleStatus {
+    /// Raffle exists in storage but the creator has not yet deposited the prize.
+    /// Ticket sales, draws, and finalization are all disallowed in this state.
+    /// Added in #225 so off-chain indexers can observe the explicit transition
+    /// to `Active` once the prize is funded.
+    PendingPrize = 6,
     Active = 0,
     Drawing = 1,
     Finalized = 2,
     Cancelled = 3,
     Failed = 4,
     Claimed = 5,
+    Finalizing = 7,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -20,6 +26,13 @@ pub enum CancelReason {
     AdminCancelled = 1,
     OracleTimeout = 2,
     MinTicketsNotMet = 3,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum FailureReason {
+    ZeroTicketsSold = 0,
+    MinTicketsNotMet = 1,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -43,7 +56,10 @@ pub enum RandomnessType {
 pub struct RaffleConfig {
     pub description: String,
     pub end_time: u64,
+    pub no_deadline: bool,
     pub max_tickets: u32,
+    /// Maximum tickets a single address may purchase per transaction.
+    pub max_tickets_per_tx: u32,
     pub min_tickets: u32,
     pub allow_multiple: bool,
     pub ticket_price: i128,
@@ -60,6 +76,9 @@ pub struct RaffleConfig {
     /// Seconds after finalization before winners may claim.
     /// Must be in [0, 604800] (0 to 7 days). Defaults to 3600 if zero.
     pub claim_lockup_seconds: u64,
+    /// Swap deadline window in seconds (added to current timestamp for token swaps).
+    /// Defaults to 300 (5 minutes) if zero. Configurable to handle network congestion.
+    pub swap_deadline_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -109,6 +128,7 @@ pub struct PageResultTickets {
 #[contracttype]
 pub enum AdminOp {
     SetConfig(u32, Address),
+    UpdateWasmHash(BytesN<32>),
 }
 
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
