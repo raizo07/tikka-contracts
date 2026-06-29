@@ -2523,4 +2523,88 @@ mod test {
         );
         assert!(replay.is_err());
     }
+
+    /// Format regression guard for [`FairnessData`] returned by [`Contract::get_fairness_data`].
+    ///
+    /// Off-chain verifiers and frontends depend on the exact field names, types, and values
+    /// produced after a draw. If this test breaks, you are changing the public API — update
+    /// the changelog before updating the expected snapshot constants below.
+    #[test]
+    fn fairness_data_format_regression() {
+        const EXPECTED_SEED: u64 = 12_345;
+        const EXPECTED_TS: u64 = 1_700_000_000;
+        const EXPECTED_SEQ: u32 = 42;
+        const EXPECTED_TICKET_IDS: [u32; 5] = [1, 2, 3, 4, 5];
+        const EXPECTED_WINNING_INDICES: [u32; 2] = [0, 3];
+
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(EXPECTED_TS);
+        env.ledger().with_mut(|l| l.sequence_number = EXPECTED_SEQ);
+
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        let factory = env.register(MockFactory, ());
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let (token_addr, token_mint) = create_token(&env, &token_admin);
+        token_mint.mint(&creator, &1_000_000);
+        token_mint.mint(&buyer, &1_000_000);
+
+        let config = RaffleConfig {
+            description: String::from_str(&env, "FairnessData format regression"),
+            end_time: 0,
+            no_deadline: true,
+            max_tickets: 5,
+            max_tickets_per_tx: 5,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: MIN_TICKET_PRICE,
+            payment_token: token_addr,
+            prize_amount: MIN_TICKET_PRICE * 5,
+            prizes: vec![&env, 6000u32, 4000u32],
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(&env, &[0xFA; 32]),
+            claim_lockup_seconds: 0,
+            swap_deadline_seconds: 0,
+        };
+
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer, &5);
+
+        let raffle = client.get_raffle();
+        env.as_contract(&contract_id, || {
+            do_finalize_with_seed(&env, raffle, EXPECTED_SEED, RandomnessType::Prng)
+        })
+        .unwrap();
+
+        let fairness = client.get_fairness_data();
+
+        assert_eq!(fairness.seed, EXPECTED_SEED);
+        assert_eq!(fairness.randomness_source, RandomnessSource::Internal);
+        assert_eq!(fairness.ticket_ids.len(), 5);
+        assert_eq!(fairness.winning_ticket_indices.len(), 2);
+        assert_eq!(fairness.draw_timestamp, EXPECTED_TS);
+        assert_eq!(fairness.draw_sequence, EXPECTED_SEQ);
+
+        for (i, expected_id) in EXPECTED_TICKET_IDS.iter().enumerate() {
+            assert_eq!(fairness.ticket_ids.get(i as u32).unwrap(), *expected_id);
+        }
+        for (i, expected_idx) in EXPECTED_WINNING_INDICES.iter().enumerate() {
+            assert_eq!(
+                fairness.winning_ticket_indices.get(i as u32).unwrap(),
+                *expected_idx
+            );
+        }
+    }
 }
