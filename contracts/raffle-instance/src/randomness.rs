@@ -182,6 +182,35 @@ impl OracleSeedWinnerSelection {
     pub fn new(seed: u64) -> Self {
         Self { seed }
     }
+
+    #[cfg(any(test, feature = "std"))]
+    pub fn select_winner_indices_pure(&self, total_tickets: u32, winner_count: u32) -> std::vec::Vec<u32> {
+        let mut indices = std::vec::Vec::new();
+        if total_tickets == 0 || winner_count == 0 {
+            return indices;
+        }
+
+        let n = total_tickets as u64;
+        let largest_multiple = (u64::MAX / n) * n;
+
+        let mut current_seed = self.seed;
+        for _ in 0..winner_count {
+            let idx = loop {
+                if current_seed < largest_multiple {
+                    break (current_seed % n) as u32;
+                }
+                current_seed = current_seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+            };
+            indices.push(idx);
+            current_seed = current_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
+
+        indices
+    }
 }
 
 impl WinnerSelectionStrategy for OracleSeedWinnerSelection {

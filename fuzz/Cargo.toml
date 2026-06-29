@@ -15,11 +15,18 @@ name = "fuzz_finalize_raffle"
 path = "fuzz_targets/fuzz_finalize_raffle.rs"
 test = false
 
+[[bin]]
+name = "fuzz_winner_selection"
+path = "fuzz_targets/fuzz_winner_selection.rs"
+test = false
+
 [dependencies]
 # libfuzzer-sys wires rust code to LLVM libFuzzer
 libfuzzer-sys = "0.4"
 # Derives arbitrary byte→type conversion for fuzzer inputs
 arbitrary     = { version = "1", features = ["derive"] }
+# Local contracts
+tikka-raffle-instance = { path = "../contracts/raffle-instance", features = ["std"] }
 
 [profile.release]
 # Optimisation level useful for fuzzing; debug info helps with crash reports
