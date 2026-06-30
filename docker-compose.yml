@@ -1,0 +1,11 @@
+version: '3.9'
+
+services:
+  oracle:
+    build: ./oracle
+    environment:
+      - ORACLE_SECRET_KEY=${ORACLE_SECRET_KEY}
+      - STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+      - FACTORY_CONTRACT_ID=${FACTORY_CONTRACT_ID}
+      - LOG_LEVEL=debug
+    restart: unless-stopped

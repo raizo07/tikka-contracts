@@ -1,6 +1,8 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, Vec,
 };
@@ -68,6 +70,9 @@ pub enum DataKey {
     TotalVolumePerAsset(Address),
     /// Kept for test-only address generation; not used for indexing.
     RaffleInstancesCount,
+    /// Per-creator raffle index: creator Address → Vec<Address> of raffle addresses.
+    /// Appended to on every successful `create_raffle`.
+    CreatorRaffles(Address),
 }
 
 #[derive(Clone)]
@@ -159,14 +164,15 @@ fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
         ledger_timestamp,
         aggregate_hash: aggregate_hash.into(),
     }
+    .publish(&env);
     .publish(env);
 }
 
 /// Validate that an address is usable for a privileged role (admin/treasury).
 ///
-/// Rejects the zero address (all-zero contract id) and any other non-existent
-/// address, as well as the factory's own address to prevent a self-referential
-/// admin or treasury that would brick the contract.
+/// Rejects the zero contract address (all-zero 32-byte hash) and the factory's
+/// own address to prevent a self-referential admin or treasury that would brick
+/// the contract.  Account (keypair) addresses are always accepted.
 fn require_valid_role_address(env: &Env, address: &Address) -> Result<(), ContractError> {
     #[cfg(not(test))]
     if !address.exists() {
@@ -177,8 +183,7 @@ fn require_valid_role_address(env: &Env, address: &Address) -> Result<(), Contra
     #[cfg(test)]
     {
         use soroban_sdk::String;
-        const ZERO_CONTRACT: &str =
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        const ZERO_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let zero = Address::from_string(&String::from_str(env, ZERO_CONTRACT));
         if *address == zero {
             return Err(ContractError::InvalidParameters);
@@ -217,9 +222,7 @@ impl RaffleFactory {
         env.storage()
             .persistent()
             .set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Initialized, &true);
+        env.storage().persistent().set(&DataKey::Initialized, &true);
 
         events::FactoryInitialized {
             admin,
@@ -413,8 +416,16 @@ impl RaffleFactory {
         final_config.protocol_fee_bp = protocol_fee_bp;
         final_config.treasury_address = Some(treasury);
 
-        let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotAuthorized)?;
         let factory_address = env.current_contract_address();
+
+        let salt = env
+            .crypto()
+            .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
 
         #[cfg(not(test))]
         let raffle_address = {
@@ -422,7 +433,7 @@ impl RaffleFactory {
                 .storage()
                 .persistent()
                 .get(&DataKey::InstanceWasmHash)
-                .unwrap();
+                .ok_or(ContractError::InvalidParameters)?;
             let salt = env
                 .crypto()
                 .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
@@ -454,7 +465,7 @@ impl RaffleFactory {
         env.invoke_contract::<()>(
             &raffle_address,
             &Symbol::new(&env, "init"),
-            (factory_address, admin, creator, final_config).into_val(&env),
+            (factory_address, admin, creator.clone(), final_config).into_val(&env),
         );
 
         // --- O(1) stable-map registration ---
@@ -472,6 +483,19 @@ impl RaffleFactory {
         env.storage()
             .persistent()
             .set(&DataKey::NextRaffleId, &(stable_id.saturating_add(1)));
+
+        // --- per-creator index ---
+        // Append the new raffle address to the creator's list so callers can
+        // query all raffles for a given creator without scanning the full list.
+        let mut creator_raffles: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorRaffles(creator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        creator_raffles.push_back(raffle_address.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreatorRaffles(creator.clone()), &creator_raffles);
 
         // Increment the live-count for stats.
         let live_count: u32 = env
@@ -635,6 +659,48 @@ impl RaffleFactory {
         }
     }
 
+    /// Return a paginated list of raffle addresses created by `creator`.
+    ///
+    /// `params.offset` is an index into the creator's personal raffle list
+    /// (not the global stable-ID space).  `params.limit` is clamped by
+    /// `effective_limit` (1–200, default 100).
+    pub fn get_raffles_by_creator(
+        env: Env,
+        creator: Address,
+        params: PaginationParams,
+    ) -> PageResultRaffles {
+        let creator_raffles: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorRaffles(creator))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = creator_raffles.len();
+        let lim = effective_limit(params.limit);
+        let offset = params.offset;
+
+        if offset >= total {
+            return PageResultRaffles {
+                items: Vec::new(&env),
+                total,
+                has_more: false,
+            };
+        }
+
+        let end = offset.saturating_add(lim).min(total);
+        let mut items: Vec<Address> = Vec::new(&env);
+        for i in offset..end {
+            items.push_back(creator_raffles.get(i).unwrap());
+        }
+
+        let has_more = end < total;
+        PageResultRaffles {
+            items,
+            total,
+            has_more,
+        }
+    }
+
     pub fn pause_factory(env: Env) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -704,7 +770,11 @@ impl RaffleFactory {
             .ok_or(ContractError::NoPendingTransfer)?;
         pending.require_auth();
 
-        let old_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+        let old_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotAuthorized)?;
 
         env.storage().persistent().set(&DataKey::Admin, &pending);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
@@ -871,6 +941,15 @@ impl RaffleFactory {
         let raffle_address: Address = env
             .storage()
             .persistent()
+            .get(&DataKey::RaffleInstances)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if raffle_id >= instances.len() {
+            return Err(ContractError::InvalidRaffleId);
+        }
+
+        let raffle_address = instances.get(raffle_id).unwrap();
+
             .get(&DataKey::RaffleById(raffle_id))
             .ok_or(ContractError::InvalidRaffleId)?;
 
@@ -912,7 +991,8 @@ impl RaffleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::String;
+    use raffle_shared::{RandomnessSource, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
+    use soroban_sdk::{String, Vec as SdkVec};
 
     fn setup_factory(env: &Env) -> (RaffleFactoryClient<'_>, Address, Address) {
         let admin = Address::generate(env);
@@ -926,6 +1006,95 @@ mod tests {
         client.set_creation_delay(&0u64);
 
         (client, admin, treasury)
+    }
+
+    fn test_raffle_config(env: &Env, payment_token: &Address) -> RaffleConfig {
+        RaffleConfig {
+            description: String::from_str(env, "Test Raffle"),
+            end_time: 0,
+            no_deadline: true,
+            max_tickets: 10,
+            max_tickets_per_tx: 10,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: 10_000,
+            payment_token: payment_token.clone(),
+            prize_amount: 10_000,
+            prizes: SdkVec::from_array(env, [10_000u32]),
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(env, &[1u8; 32]),
+            claim_lockup_seconds: 0,
+            swap_deadline_seconds: 0,
+        }
+    }
+
+    fn create_raffles_via_factory(
+        env: &Env,
+        client: &RaffleFactoryClient<'_>,
+        admin: &Address,
+        treasury: &Address,
+        creator: &Address,
+        count: u32,
+    ) -> SdkVec<Address> {
+        use raffle_instance::ContractClient as RaffleInstanceClient;
+
+        let factory_address = client.address.clone();
+        let token_admin = Address::generate(env);
+        let payment_token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let protocol_fee_bp: u32 = env.as_contract(&factory_address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ProtocolFeeBP)
+                .unwrap_or(0)
+        });
+
+        let mut addrs = SdkVec::new(env);
+        for _ in 0..count {
+            let mut config = test_raffle_config(env, &payment_token);
+            config.protocol_fee_bp = protocol_fee_bp;
+            config.treasury_address = Some(treasury.clone());
+
+            let raffle_address = env.register(raffle_instance::Contract, ());
+            RaffleInstanceClient::new(env, &raffle_address).init(
+                &factory_address,
+                admin,
+                creator,
+                &config,
+            );
+
+            env.as_contract(&factory_address, || {
+                let stable_id: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::NextRaffleId)
+                    .unwrap_or(0u32);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RaffleById(stable_id), &raffle_address);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::NextRaffleId, &(stable_id.saturating_add(1)));
+                let live_count: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RaffleCount)
+                    .unwrap_or(0u32)
+                    .saturating_add(1);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RaffleCount, &live_count);
+            });
+
+            addrs.push_back(raffle_address);
+        }
+        addrs
     }
 
     #[test]
@@ -1133,12 +1302,8 @@ mod tests {
                     .set(&DataKey::RaffleById(i), &addr);
                 addrs.push_back(addr);
             }
-            env.storage()
-                .persistent()
-                .set(&DataKey::NextRaffleId, &n);
-            env.storage()
-                .persistent()
-                .set(&DataKey::RaffleCount, &n);
+            env.storage().persistent().set(&DataKey::NextRaffleId, &n);
+            env.storage().persistent().set(&DataKey::RaffleCount, &n);
         });
         addrs
     }
@@ -1244,6 +1409,106 @@ mod tests {
     }
 
     #[test]
+    fn get_raffles_page_empty_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 10,
+            offset: 0,
+        });
+        assert_eq!(page.items.len(), 0u32);
+        assert_eq!(page.total, 0u32);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn get_raffles_page_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+        create_raffles_via_factory(&env, &client, &_admin, &_treasury, &creator, 15);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 10,
+            offset: 0,
+        });
+        assert_eq!(page.items.len(), 10u32);
+        assert_eq!(page.total, 15u32);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn get_raffles_page_last_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+        create_raffles_via_factory(&env, &client, &_admin, &_treasury, &creator, 15);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 10,
+            offset: 10,
+        });
+        assert_eq!(page.items.len(), 5u32);
+        assert_eq!(page.total, 15u32);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn get_raffles_page_offset_beyond_total() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+        create_raffles_via_factory(&env, &client, &_admin, &_treasury, &creator, 5);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 10,
+            offset: 10,
+        });
+        assert_eq!(page.items.len(), 0u32);
+        assert_eq!(page.total, 5u32);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn get_raffles_page_limit_zero_uses_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+        create_raffles_via_factory(&env, &client, &_admin, &_treasury, &creator, 150);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 0,
+            offset: 0,
+        });
+        assert_eq!(page.items.len(), DEFAULT_PAGE_LIMIT);
+        assert_eq!(page.total, 150u32);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn get_raffles_page_limit_above_max_is_clamped() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+        create_raffles_via_factory(&env, &client, &_admin, &_treasury, &creator, 250);
+
+        let page = client.get_raffles_page(&PaginationParams {
+            limit: 999,
+            offset: 0,
+        });
+        assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
+        assert_eq!(page.total, 250u32);
+        assert!(page.has_more);
+    }
+
+    #[test]
     fn test_clean_old_raffle_invalid_id_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1275,5 +1540,175 @@ mod tests {
             client.try_clean_old_raffle(&1u32),
             Err(Ok(ContractError::InvalidRaffleId))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Creator index tests
+    // -----------------------------------------------------------------------
+
+    /// Seed the per-creator index directly in storage with `addrs`.
+    fn seed_creator_index(env: &Env, factory_id: &Address, creator: &Address, addrs: &[Address]) {
+        env.as_contract(factory_id, || {
+            let mut v: Vec<Address> = Vec::new(env);
+            for a in addrs {
+                v.push_back(a.clone());
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::CreatorRaffles(creator.clone()), &v);
+        });
+    }
+
+    #[test]
+    fn test_get_raffles_by_creator_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+        let creator = Address::generate(&env);
+
+        let page = client.get_raffles_by_creator(
+            &creator,
+            &raffle_shared::PaginationParams { limit: 10, offset: 0 },
+        );
+        assert_eq!(page.items.len(), 0u32);
+        assert_eq!(page.total, 0u32);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn test_get_raffles_by_creator_basic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+
+        let creator_a = Address::generate(&env);
+        let creator_b = Address::generate(&env);
+
+        // 5 raffles for A, 3 for B.
+        let mut a_addrs = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        let b_addrs = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+
+        seed_creator_index(&env, &client.address, &creator_a, &a_addrs);
+        seed_creator_index(&env, &client.address, &creator_b, &b_addrs);
+
+        // Creator A: full page.
+        let page_a = client.get_raffles_by_creator(
+            &creator_a,
+            &raffle_shared::PaginationParams { limit: 10, offset: 0 },
+        );
+        assert_eq!(page_a.total, 5u32);
+        assert_eq!(page_a.items.len(), 5u32);
+        assert!(!page_a.has_more);
+        for (i, addr) in a_addrs.iter().enumerate() {
+            assert_eq!(page_a.items.get(i as u32).unwrap(), addr.clone());
+        }
+
+        // Creator B: full page.
+        let page_b = client.get_raffles_by_creator(
+            &creator_b,
+            &raffle_shared::PaginationParams { limit: 10, offset: 0 },
+        );
+        assert_eq!(page_b.total, 3u32);
+        assert_eq!(page_b.items.len(), 3u32);
+        assert!(!page_b.has_more);
+        for (i, addr) in b_addrs.iter().enumerate() {
+            assert_eq!(page_b.items.get(i as u32).unwrap(), addr.clone());
+        }
+    }
+
+    #[test]
+    fn test_get_raffles_by_creator_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+
+        let creator = Address::generate(&env);
+        let addrs = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        seed_creator_index(&env, &client.address, &creator, &addrs);
+
+        // Page 0: offset=0, limit=3 → items 0,1,2; has_more=true.
+        let p0 = client.get_raffles_by_creator(
+            &creator,
+            &raffle_shared::PaginationParams { limit: 3, offset: 0 },
+        );
+        assert_eq!(p0.items.len(), 3u32);
+        assert_eq!(p0.total, 5u32);
+        assert!(p0.has_more);
+        assert_eq!(p0.items.get(0).unwrap(), addrs[0].clone());
+        assert_eq!(p0.items.get(2).unwrap(), addrs[2].clone());
+
+        // Page 1: offset=3, limit=3 → items 3,4; has_more=false.
+        let p1 = client.get_raffles_by_creator(
+            &creator,
+            &raffle_shared::PaginationParams { limit: 3, offset: 3 },
+        );
+        assert_eq!(p1.items.len(), 2u32);
+        assert_eq!(p1.total, 5u32);
+        assert!(!p1.has_more);
+        assert_eq!(p1.items.get(0).unwrap(), addrs[3].clone());
+        assert_eq!(p1.items.get(1).unwrap(), addrs[4].clone());
+
+        // Out-of-range offset → empty, has_more=false.
+        let p_oor = client.get_raffles_by_creator(
+            &creator,
+            &raffle_shared::PaginationParams { limit: 10, offset: 99 },
+        );
+        assert_eq!(p_oor.items.len(), 0u32);
+        assert!(!p_oor.has_more);
+
+        // Exact boundary: offset=5 (== total) → empty.
+        let p_exact = client.get_raffles_by_creator(
+            &creator,
+            &raffle_shared::PaginationParams { limit: 10, offset: 5 },
+        );
+        assert_eq!(p_exact.items.len(), 0u32);
+        assert!(!p_exact.has_more);
+    }
+
+    #[test]
+    fn test_creator_index_isolates_separate_creators() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _treasury) = setup_factory(&env);
+
+        let creator_a = Address::generate(&env);
+        let creator_b = Address::generate(&env);
+
+        let a_addrs = [Address::generate(&env), Address::generate(&env)];
+        let b_addrs = [Address::generate(&env)];
+
+        seed_creator_index(&env, &client.address, &creator_a, &a_addrs);
+        seed_creator_index(&env, &client.address, &creator_b, &b_addrs);
+
+        // A sees only its own raffles.
+        let pa = client.get_raffles_by_creator(
+            &creator_a,
+            &raffle_shared::PaginationParams { limit: 10, offset: 0 },
+        );
+        assert_eq!(pa.total, 2u32);
+
+        // B sees only its own raffle.
+        let pb = client.get_raffles_by_creator(
+            &creator_b,
+            &raffle_shared::PaginationParams { limit: 10, offset: 0 },
+        );
+        assert_eq!(pb.total, 1u32);
+        assert_eq!(pb.items.get(0).unwrap(), b_addrs[0].clone());
     }
 }
