@@ -10,13 +10,16 @@ The oracle requires a secure keypair to sign reveal transactions. The `KeyServic
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ORACLE_SECRET_KEY` | Yes (local) | Oracle secret key (`S...`), 32-byte hex, or base64 seed |
-| `STELLAR_RPC_URL` | No | Soroban RPC endpoint (default: testnet) |
+| `ORACLE_SECRET_KEY` | Yes | Oracle secret key (`S...`), 32-byte hex, or base64 seed |
+| `STELLAR_RPC_URL` | Yes | Soroban RPC endpoint |
+| `FACTORY_CONTRACT_ID` | Yes | Contract id that the listener subscribes to at startup |
 | `STELLAR_NETWORK_PASSPHRASE` | No | Network passphrase for transaction signing |
 | `RAFFLE_CONTRACT_ADDRESS` | Integration tests | Deployed raffle instance contract |
 | `RANDOMNESS_REQUEST_ID` | Integration tests | Pending randomness request id |
 | `RANDOMNESS_SEED` | No | Seed value for integration tests |
-| `ORACLE_POLL_INTERVAL_MS` | No | Event poller interval (default: `5000`) |
+| `POLL_INTERVAL_MS` | No | Event poller interval (default: `5000`) |
+| `ORACLE_POLL_INTERVAL_MS` | No | Backward-compatible poll interval alias |
+| `LOG_LEVEL` | No | Log verbosity (`info` by default) |
 | `ORACLE_CHECKPOINT_PATH` | No | Ledger checkpoint file for restart recovery |
 | `ORACLE_ADDRESS` | Event listener | This oracle's public key (`G...`) |
 

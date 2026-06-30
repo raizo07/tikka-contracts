@@ -1,3 +1,4 @@
+use raffle_shared::{CancelReason, RandomnessSource, RandomnessType};
 use raffle_shared::{CancelReason, FailureReason, RandomnessSource, RandomnessType};
 use soroban_sdk::{contractevent, Address, BytesN, String, Vec};
 
@@ -43,6 +44,7 @@ pub struct TicketPurchased {
     pub ticket_ids: Vec<u32>,
     pub quantity: u32,
     pub ticket_price: i128,
+    pub effective_ticket_price: i128,
     pub total_paid: i128,
     pub protocol_fee: i128,
     pub timestamp: u64,
