@@ -125,6 +125,10 @@ pub struct RaffleConfig {
     /// Swap deadline window in seconds (added to current timestamp for token swaps).
     /// Defaults to 300 (5 minutes) if zero. Configurable to handle network congestion.
     pub swap_deadline_seconds: u64,
+    /// The percentage of max_tickets covered by the early bird discount (0 to disable).
+    pub early_bird_ticket_percentage: u32,
+    /// The discount amount specified in basis points.
+    pub early_bird_discount_bp: u32,
 }
 
 impl RaffleConfig {

@@ -85,6 +85,10 @@ pub struct Raffle {
     pub swap_deadline_seconds: u64,
     /// When true, ticket purchases are blocked while the raffle remains Active.
     pub ticket_sales_paused: bool,
+    /// The percentage of max_tickets covered by the early bird discount (0 to disable).
+    pub early_bird_ticket_percentage: u32,
+    /// The discount amount specified in basis points.
+    pub early_bird_discount_bp: u32,
 }
 
 #[contracttype]
@@ -543,6 +547,14 @@ impl Contract {
             return Err(Error::InvalidParameters);
         }
 
+        // Validate early bird parameters
+        if config.early_bird_ticket_percentage > 100 {
+            return Err(Error::InvalidParameters);
+        }
+        if config.early_bird_ticket_percentage > 0 && config.early_bird_discount_bp > 10000 {
+            return Err(Error::InvalidParameters);
+        }
+
         let raffle = Raffle {
             creator: creator.clone(),
             description: config.description.clone(),
@@ -571,6 +583,8 @@ impl Contract {
             claim_lockup_seconds: config.claim_lockup_seconds,
             swap_deadline_seconds: config.swap_deadline_seconds,
             ticket_sales_paused: false,
+            early_bird_ticket_percentage: config.early_bird_ticket_percentage,
+            early_bird_discount_bp: config.early_bird_discount_bp,
         };
         write_raffle(&env, &raffle);
         env.storage().instance().set(&DataKey::Factory, &factory);
@@ -703,8 +717,20 @@ impl Contract {
         }
 
         let timestamp = env.ledger().timestamp();
-        let total_price = raffle
-            .ticket_price
+        let effective_price = if raffle.early_bird_ticket_percentage > 0 {
+            let early_bird_cap = raffle.max_tickets * raffle.early_bird_ticket_percentage / 100;
+            if raffle.tickets_sold < early_bird_cap {
+                raffle.ticket_price
+                    .checked_mul((10000 - raffle.early_bird_discount_bp) as i128)
+                    .ok_or(Error::ArithmeticOverflow)?
+                    / 10000
+            } else {
+                raffle.ticket_price
+            }
+        } else {
+            raffle.ticket_price
+        };
+        let total_price = effective_price
             .checked_mul(quantity as i128)
             .ok_or(Error::InvalidParameters)?;
 
@@ -864,6 +890,7 @@ impl Contract {
             ticket_ids,
             quantity,
             ticket_price: raffle.ticket_price,
+            effective_ticket_price: effective_price,
             total_paid: total_price,
             protocol_fee,
             timestamp,
