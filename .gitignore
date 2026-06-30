@@ -35,3 +35,9 @@ requirements.md
 skills-lock.json
 
 issue.md
+*.log
+output*.txt
+test_out*.txt
+check_out*.txt
+error*.txt
+*.tar.gz

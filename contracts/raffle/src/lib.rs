@@ -1,6 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, Vec,
 };
@@ -162,14 +163,15 @@ fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
         ledger_timestamp,
         aggregate_hash: aggregate_hash.into(),
     }
+    .publish(&env);
     .publish(env);
 }
 
 /// Validate that an address is usable for a privileged role (admin/treasury).
 ///
-/// Rejects the zero address (all-zero contract id) and any other non-existent
-/// address, as well as the factory's own address to prevent a self-referential
-/// admin or treasury that would brick the contract.
+/// Rejects the zero contract address (all-zero 32-byte hash) and the factory's
+/// own address to prevent a self-referential admin or treasury that would brick
+/// the contract.  Account (keypair) addresses are always accepted.
 fn require_valid_role_address(env: &Env, address: &Address) -> Result<(), ContractError> {
     #[cfg(not(test))]
     if !address.exists() {
@@ -220,9 +222,7 @@ impl RaffleFactory {
         env.storage()
             .persistent()
             .set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Initialized, &true);
+        env.storage().persistent().set(&DataKey::Initialized, &true);
 
         events::FactoryInitialized {
             admin,
@@ -418,6 +418,10 @@ impl RaffleFactory {
 
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         let factory_address = env.current_contract_address();
+
+        let salt = env
+            .crypto()
+            .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
 
         #[cfg(not(test))]
         let raffle_address = {
@@ -874,6 +878,15 @@ impl RaffleFactory {
         let raffle_address: Address = env
             .storage()
             .persistent()
+            .get(&DataKey::RaffleInstances)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if raffle_id >= instances.len() {
+            return Err(ContractError::InvalidRaffleId);
+        }
+
+        let raffle_address = instances.get(raffle_id).unwrap();
+
             .get(&DataKey::RaffleById(raffle_id))
             .ok_or(ContractError::InvalidRaffleId)?;
 

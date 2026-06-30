@@ -2,9 +2,19 @@
 name = "raffle-instance"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Tikka individual raffle instance smart contract for Stellar/Soroban"
+repository = "https://github.com/crackedstudio/tikka-contracts"
+authors = ["Tikka Team"]
+keywords = ["soroban", "stellar", "raffle", "defi", "blockchain"]
+categories = ["cryptography::cryptocurrencies", "no-std"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+std = []
 
 [dependencies]
 soroban-sdk = { workspace = true }
@@ -12,4 +22,7 @@ raffle-shared = { path = "../raffle-shared" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
