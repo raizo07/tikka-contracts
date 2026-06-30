@@ -1,12 +1,24 @@
 #![cfg(test)]
 
 use super::*;
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,
-    Address, BytesN, Env, String,
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, String,
 };
 use raffle_shared::{DEFAULT_CLAIM_LOCKUP_SECONDS, DEFAULT_SWAP_DEADLINE_SECONDS};
+
+fn assert_drawing_lock_cleared(env: &Env, contract_id: &Address) {
+    let is_set: bool = env.as_contract(contract_id, || {
+        env.storage()
+            .instance()
+            .get(&crate::DataKey::DrawingLock)
+            .unwrap_or(false)
+    });
+    assert!(!is_set, "DrawingLock must be cleared");
+}
 
 #[test]
 fn test_oracle_fallback_with_ledger_delays() {
@@ -1173,4 +1185,646 @@ fn test_claim_prize_pays_full_gross_with_protocol_fee() {
 
     let ticket_fee = MIN_TICKET_PRICE * 1_000 / 10_000;
     assert_eq!(client.get_accumulated_fees(), ticket_fee);
+}
+
+#[test]
+fn prize_distribution_invariant_holds_for_multiple_tiers() {
+    let tier_configs: [[u32; 3]; 3] = [[10000, 0, 0], [5000, 5000, 0], [6000, 3000, 1000]];
+    let fee_bps = [0u32, 100, 250, 1000, 2000];
+
+    for tiers_raw in tier_configs {
+        let tiers_count = if tiers_raw[2] > 0 {
+            3
+        } else if tiers_raw[1] > 0 {
+            2
+        } else {
+            1
+        };
+
+        for fee_bp in fee_bps {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().set_timestamp(1_000);
+
+            let factory = Address::generate(&env);
+            let admin = Address::generate(&env);
+            let creator = Address::generate(&env);
+            let treasury = Address::generate(&env);
+            let buyer_a = Address::generate(&env);
+            let buyer_b = Address::generate(&env);
+            let buyer_c = Address::generate(&env);
+
+            let token_admin = Address::generate(&env);
+            let payment_token = env
+                .register_stellar_asset_contract_v2(token_admin.clone())
+                .address();
+            let token_client = StellarAssetClient::new(&env, &payment_token);
+            token_client.mint(&creator, &10_000_000);
+            token_client.mint(&buyer_a, &10_000_000);
+            token_client.mint(&buyer_b, &10_000_000);
+            token_client.mint(&buyer_c, &10_000_000);
+
+            let contract_id = env.register(Contract, ());
+            let client = ContractClient::new(&env, &contract_id);
+
+            let prize_amount: i128 = 1_000_000;
+            let ticket_price: i128 = MIN_TICKET_PRICE;
+            let tickets_to_sell: u32 = tiers_count;
+            let total_ticket_sales = ticket_price * tickets_to_sell as i128;
+            let expected_ticket_fees = total_ticket_sales * fee_bp as i128 / 10_000;
+
+            let prizes = match tiers_count {
+                1 => soroban_sdk::vec![&env, tiers_raw[0]],
+                2 => soroban_sdk::vec![&env, tiers_raw[0], tiers_raw[1]],
+                _ => soroban_sdk::vec![&env, tiers_raw[0], tiers_raw[1], tiers_raw[2]],
+            };
+
+            let config = RaffleConfig {
+                description: String::from_str(&env, "Prize invariant"),
+                end_time: 0,
+                no_deadline: true,
+                max_tickets: tickets_to_sell,
+                max_tickets_per_tx: tickets_to_sell,
+                min_tickets: 1,
+                allow_multiple: true,
+                ticket_price,
+                payment_token: payment_token.clone(),
+                prize_amount,
+                prizes,
+                randomness_source: RandomnessSource::Internal,
+                oracle_address: None,
+                protocol_fee_bp: fee_bp,
+                treasury_address: Some(treasury.clone()),
+                swap_router: None,
+                tikka_token: None,
+                metadata_hash: BytesN::from_array(&env, &[33; 32]),
+                claim_lockup_seconds: 0,
+                swap_deadline_seconds: 0,
+            };
+
+            client.init(&factory, &admin, &creator, &config);
+            client.deposit_prize();
+
+            client.buy_tickets(&buyer_a, &1);
+            if tickets_to_sell > 1 {
+                client.buy_tickets(&buyer_b, &1);
+            }
+            if tickets_to_sell > 2 {
+                client.buy_tickets(&buyer_c, &1);
+            }
+
+            client.finalize_raffle();
+
+            let token = soroban_sdk::token::Client::new(&env, &payment_token);
+            let contract_balance_before_claims = token.balance(&contract_id);
+
+            env.ledger()
+                .set_timestamp(1_000 + DEFAULT_CLAIM_LOCKUP_SECONDS + 1);
+
+            let raffle = client.get_raffle();
+            let mut total_claimed = 0i128;
+            for i in 0..raffle.winners.len() {
+                let winner = raffle.winners.get(i).unwrap();
+                let claimed = client.claim_prize(&winner, &i);
+                total_claimed += claimed;
+            }
+
+            // Core invariant: all prize value is either claimed or explicitly
+            // accounted as protocol fee. Current implementation has zero
+            // protocol fee on prize claims, so this catches accidental
+            // underpayment/double-fee regressions.
+            let fee_from_prize = prize_amount - total_claimed;
+            assert_eq!(total_claimed + fee_from_prize, prize_amount);
+            assert_eq!(fee_from_prize, 0);
+
+            assert_eq!(token.balance(&treasury), expected_ticket_fees);
+
+            let contract_balance_after_claims = token.balance(&contract_id);
+            assert_eq!(
+                contract_balance_after_claims,
+                contract_balance_before_claims - prize_amount
+            );
+        }
+    }
+}
+
+#[test]
+fn commit_reveal_entropy_is_mixed_from_all_tickets() {
+    fn run_seed(commit_b: [u8; 32], metadata_byte: u8) -> u64 {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let factory = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer_a = Address::generate(&env);
+        let buyer_b = Address::generate(&env);
+        let buyer_c = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let payment_token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let token_client = StellarAssetClient::new(&env, &payment_token);
+        token_client.mint(&creator, &1_000_000);
+        token_client.mint(&buyer_a, &1_000_000);
+        token_client.mint(&buyer_b, &1_000_000);
+        token_client.mint(&buyer_c, &1_000_000);
+
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        let config = RaffleConfig {
+            description: String::from_str(&env, "Commit reveal entropy"),
+            end_time: 0,
+            no_deadline: true,
+            max_tickets: 3,
+            max_tickets_per_tx: 3,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: MIN_TICKET_PRICE,
+            payment_token: payment_token.clone(),
+            prize_amount: MIN_TICKET_PRICE * 10,
+            prizes: soroban_sdk::vec![&env, 6000, 3000, 1000],
+            randomness_source: RandomnessSource::CommitReveal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(&env, &[metadata_byte; 32]),
+            claim_lockup_seconds: 0,
+            swap_deadline_seconds: 0,
+        };
+
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer_a, &1);
+        client.buy_tickets(&buyer_b, &1);
+        client.buy_tickets(&buyer_c, &1);
+
+        let commit_a = [1u8; 32];
+        let commit_c = [3u8; 32];
+        client.submit_commit(&1, &BytesN::from_array(&env, &commit_a));
+        client.submit_commit(&2, &BytesN::from_array(&env, &commit_b));
+        client.submit_commit(&3, &BytesN::from_array(&env, &commit_c));
+
+        client.finalize_raffle();
+
+        let fairness = client.get_fairness_data();
+
+        let mut combined = Bytes::new(&env);
+        combined.extend_from_array(&commit_a);
+        combined.extend_from_array(&commit_b);
+        combined.extend_from_array(&commit_c);
+        let hash: BytesN<32> = env.crypto().sha256(&combined).into();
+        let arr = hash.to_array();
+        let expected_seed = u64::from_be_bytes([
+            arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
+        ]);
+
+        assert_eq!(fairness.seed, expected_seed);
+        fairness.seed
+    }
+
+    let seed_original = run_seed([2u8; 32], 44);
+    let seed_changed = run_seed([9u8; 32], 45);
+    assert_ne!(seed_original, seed_changed);
+}
+
+#[test]
+fn commit_reveal_preserves_entropy_after_ticket_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let buyer_a = Address::generate(&env);
+    let buyer_b = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+    token_client.mint(&buyer_a, &1_000_000);
+    token_client.mint(&buyer_b, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Commit survives transfer"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 5,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::CommitReveal,
+        oracle_address: None,
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[46; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&buyer_a, &1);
+
+    let commit = [7u8; 32];
+    client.submit_commit(&1, &BytesN::from_array(&env, &commit));
+
+    // Simulate ownership transfer to validate commit persistence by ticket_id.
+    env.as_contract(&contract_id, || {
+        let mut ticket: Ticket = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Ticket(1))
+            .unwrap();
+        ticket.owner = buyer_b.clone();
+        env.storage().persistent().set(&DataKey::Ticket(1), &ticket);
+    });
+
+    client.finalize_raffle();
+    let fairness = client.get_fairness_data();
+
+    let mut combined = Bytes::new(&env);
+    combined.extend_from_array(&commit);
+    let hash: BytesN<32> = env.crypto().sha256(&combined).into();
+    let arr = hash.to_array();
+    let expected_seed = u64::from_be_bytes([
+        arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
+    ]);
+
+    assert_eq!(fairness.seed, expected_seed);
+}
+
+#[test]
+fn commit_reveal_with_zero_commits_falls_back_to_prng() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(7_777);
+    env.ledger().with_mut(|l| {
+        l.sequence_number = 999;
+    });
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let buyer_a = Address::generate(&env);
+    let buyer_b = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+    token_client.mint(&buyer_a, &1_000_000);
+    token_client.mint(&buyer_b, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Commit reveal no commits"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 2,
+        max_tickets_per_tx: 2,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 8,
+        prizes: soroban_sdk::vec![&env, 7000, 3000],
+        randomness_source: RandomnessSource::CommitReveal,
+        oracle_address: None,
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[47; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&buyer_a, &1);
+    client.buy_tickets(&buyer_b, &1);
+    client.finalize_raffle();
+
+    let raffle = client.get_raffle();
+    assert_eq!(raffle.status, RaffleStatus::Finalized);
+
+    let fairness = client.get_fairness_data();
+    let expected_seed = env.as_contract(&contract_id, || {
+        let payload = (
+            env.ledger().timestamp(),
+            env.ledger().sequence(),
+            env.current_contract_address().to_xdr(&env),
+        )
+            .to_xdr(&env);
+        let hash: BytesN<32> = env.crypto().sha256(&payload).into();
+        let arr = hash.to_array();
+        u64::from_be_bytes([
+            arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7],
+        ])
+    });
+    assert_eq!(fairness.seed, expected_seed);
+    assert_eq!(raffle.winners.len(), 2);
+}
+
+#[test]
+fn drawing_lock_cleared_after_internal_finalize() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Lock internal finalize"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 2,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::Internal,
+        oracle_address: None,
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[48; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&creator, &1);
+    client.finalize_raffle();
+
+    assert_drawing_lock_cleared(&env, &contract_id);
+}
+
+#[test]
+fn drawing_lock_cleared_after_oracle_randomness() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Lock oracle finalize"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 2,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::External,
+        oracle_address: Some(oracle),
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[49; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&creator, &1);
+
+    let request_id: u64 = env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::RandomnessRequestId)
+            .unwrap()
+    });
+
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let verifying = signing_key.verifying_key();
+    let message = env.as_contract(&contract_id, || {
+        build_vrf_proof_message(&env, request_id, 424242)
+    });
+    let signature = signing_key.sign(message.as_slice());
+
+    client.provide_randomness(
+        &424242,
+        &BytesN::from_array(&env, &verifying.to_bytes()),
+        &BytesN::from_array(&env, &signature.to_bytes()),
+        &request_id,
+    );
+
+    assert_drawing_lock_cleared(&env, &contract_id);
+}
+
+#[test]
+fn drawing_lock_cleared_after_fallback_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Lock fallback refund"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 2,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::External,
+        oracle_address: Some(oracle),
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[50; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&creator, &1);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ORACLE_TIMEOUT_LEDGERS + 1;
+    });
+    client.trigger_randomness_fallback(&creator, &true);
+
+    assert_drawing_lock_cleared(&env, &contract_id);
+}
+
+#[test]
+fn drawing_lock_cleared_after_fallback_no_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Lock fallback finalize"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 2,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::External,
+        oracle_address: Some(oracle),
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[51; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&creator, &1);
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ORACLE_TIMEOUT_LEDGERS + 1;
+    });
+    client.trigger_randomness_fallback(&creator, &false);
+
+    assert_drawing_lock_cleared(&env, &contract_id);
+}
+
+#[test]
+fn drawing_lock_cleared_after_cancel_in_drawing_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let payment_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = StellarAssetClient::new(&env, &payment_token);
+    token_client.mint(&creator, &1_000_000);
+
+    let contract_id = env.register(Contract, ());
+    let client = ContractClient::new(&env, &contract_id);
+
+    let config = RaffleConfig {
+        description: String::from_str(&env, "Lock cancel drawing"),
+        end_time: 0,
+        no_deadline: true,
+        max_tickets: 1,
+        max_tickets_per_tx: 1,
+        min_tickets: 1,
+        allow_multiple: true,
+        ticket_price: MIN_TICKET_PRICE,
+        payment_token: payment_token.clone(),
+        prize_amount: MIN_TICKET_PRICE * 2,
+        prizes: soroban_sdk::vec![&env, 10000],
+        randomness_source: RandomnessSource::External,
+        oracle_address: Some(oracle),
+        protocol_fee_bp: 0,
+        treasury_address: None,
+        swap_router: None,
+        tikka_token: None,
+        metadata_hash: BytesN::from_array(&env, &[52; 32]),
+        claim_lockup_seconds: 0,
+        swap_deadline_seconds: 0,
+    };
+
+    client.init(&factory, &admin, &creator, &config);
+    client.deposit_prize();
+    client.buy_tickets(&creator, &1);
+    client.cancel_raffle(&CancelReason::CreatorCancelled);
+
+    assert_drawing_lock_cleared(&env, &contract_id);
 }

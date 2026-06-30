@@ -1162,15 +1162,15 @@ impl Contract {
         caller: Address,
         do_refund: bool,
     ) -> Result<(), Error> {
-        // # SECURITY: fast-path guard — if DrawingLock is true, another Drawing transition is
-        // already in progress; reject without reading further state
+        // # SECURITY: fallback is only valid while a draw is in progress.
+        // If DrawingLock is already false, the draw has completed or never started.
         let drawing_lock: bool = env
             .storage()
             .instance()
             .get(&DataKey::DrawingLock)
             .unwrap_or(false);
-        if drawing_lock {
-            return Err(Error::DrawingAlreadyInProgress);
+        if !drawing_lock {
+            return Err(Error::DrawingAlreadyComplete);
         }
 
         caller.require_auth();
@@ -1410,6 +1410,21 @@ impl Contract {
         let _old_status = raffle.status.clone();
         raffle.status = RaffleStatus::Cancelled;
         write_raffle(&env, &raffle);
+
+        // If cancellation happens during drawing, clear pending randomness and
+        // release the drawing lock so the contract cannot remain bricked.
+        if was_drawing {
+            env.storage()
+                .instance()
+                .remove(&DataKey::RandomnessRequested);
+            env.storage()
+                .instance()
+                .remove(&DataKey::RandomnessRequestId);
+            env.storage()
+                .instance()
+                .remove(&DataKey::RandomnessRequestLedger);
+            env.storage().instance().set(&DataKey::DrawingLock, &false);
+        }
 
         RaffleCancelled {
             creator: raffle.creator.clone(),
